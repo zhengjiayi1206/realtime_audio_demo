@@ -10,8 +10,15 @@ export class RealtimeAudioClient extends EventTarget {
       getPrefillMs: () => 600,
       getSkillNames: () => [],
       getOutputAudio: () => false,
+      getStreamSpeechAudio: () => false,
       getVadConfig: () => null,
+      getBargeInVadConfig: () => null,
+      getVadMonitorWebSocketUrl: defaultVadMonitorWebSocketUrl,
       useWebAudioPlayback: false,
+      enableBargeIn: false,
+      bargeInAfterFinalResultOnly: false,
+      bargeInChunkMs: 120,
+      bargeInCooldownMs: 800,
       autoVad: false,
       vadFrameMs: 50,
       vadThreshold: 0.018,
@@ -49,6 +56,15 @@ export class RealtimeAudioClient extends EventTarget {
       flushResolve: null,
       playbackContext: null,
       playbackGeneration: 0,
+      bargeInWs: null,
+      bargeInStream: null,
+      bargeInAudioContext: null,
+      bargeInSource: null,
+      bargeInNode: null,
+      bargeInSink: null,
+      bargeInStartedAt: 0,
+      bargeInStarting: false,
+      bargeInTriggered: false,
       vad: this.createVadState(),
     };
     this.setMode("idle");
@@ -142,6 +158,7 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.finalHistoryText = "";
     this.state.historySavedForTurn = false;
     this.state.interrupted = false;
+    this.state.bargeInTriggered = false;
     this.state.vad = this.createVadState();
     this.emitMetrics();
 
@@ -204,6 +221,7 @@ export class RealtimeAudioClient extends EventTarget {
         prompt: this.options.getPrompt().trim(),
         skillNames: this.options.getSkillNames(),
         outputAudio: Boolean(this.options.getOutputAudio()),
+        streamSpeechAudio: Boolean(this.options.getStreamSpeechAudio()),
         vad: this.options.getVadConfig(),
         history: this.state.history,
       }),
@@ -239,6 +257,171 @@ export class RealtimeAudioClient extends EventTarget {
       this.state.playbackContext = new AudioContextCtor();
     }
     return this.state.playbackContext;
+  }
+
+  async startBargeInMonitor() {
+    if (!this.options.enableBargeIn || this.state.bargeInWs || this.state.bargeInStarting) return;
+    if (!this.state.audioPlaying) return;
+
+    this.state.bargeInStarting = true;
+    const generation = this.state.playbackGeneration;
+    let socket = null;
+    try {
+      socket = new WebSocket(this.options.getVadMonitorWebSocketUrl());
+      this.state.bargeInWs = socket;
+      socket.binaryType = "arraybuffer";
+      socket.onmessage = (event) => this.onBargeInEvent(event, socket, generation);
+      socket.onerror = () => this.log("barge-in VAD WebSocket 错误", "error");
+      await new Promise((resolve, reject) => {
+        socket.onopen = resolve;
+        socket.onclose = () => reject(new Error("barge-in VAD WebSocket closed before start"));
+      });
+
+      if (generation !== this.state.playbackGeneration || !this.state.audioPlaying) {
+        this.stopBargeInMonitor();
+        return;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      this.state.bargeInStream = stream;
+      const audioContext = new AudioContext({ latencyHint: "interactive" });
+      this.state.bargeInAudioContext = audioContext;
+      await audioContext.audioWorklet.addModule(this.options.recorderWorkletUrl);
+      const source = audioContext.createMediaStreamSource(stream);
+      const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
+        processorOptions: {
+          chunkMs: Number(this.options.bargeInChunkMs || 120),
+          vadFrameMs: this.options.vadFrameMs,
+        },
+      });
+      const sink = audioContext.createGain();
+      sink.gain.value = 0;
+
+      if (generation !== this.state.playbackGeneration || !this.state.audioPlaying) {
+        this.stopBargeInMonitor();
+        return;
+      }
+
+      this.state.bargeInSource = source;
+      this.state.bargeInNode = node;
+      this.state.bargeInSink = sink;
+      this.state.bargeInStartedAt = performance.now();
+
+      node.port.onmessage = (event) => {
+        if (!event.data || event.data.type !== "chunk") return;
+        if (this.state.bargeInWs !== socket || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(event.data.pcm);
+      };
+
+      source.connect(node);
+      node.connect(sink);
+      sink.connect(audioContext.destination);
+
+      const vad = this.options.getBargeInVadConfig() || this.options.getVadConfig();
+      socket.send(
+        JSON.stringify({
+          type: "start",
+          sampleRate: audioContext.sampleRate,
+          vad,
+        }),
+      );
+      this.log("barge-in VAD monitor started");
+    } catch (err) {
+      this.log(`barge-in monitor start failed: ${err.message || err}`, "error");
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+      this.stopBargeInMonitor();
+    } finally {
+      this.state.bargeInStarting = false;
+    }
+  }
+
+  stopBargeInMonitor() {
+    if (this.state.bargeInNode) this.state.bargeInNode.disconnect();
+    if (this.state.bargeInSource) this.state.bargeInSource.disconnect();
+    if (this.state.bargeInSink) this.state.bargeInSink.disconnect();
+    if (this.state.bargeInStream) {
+      this.state.bargeInStream.getTracks().forEach((track) => track.stop());
+    }
+    if (this.state.bargeInAudioContext) {
+      this.state.bargeInAudioContext.close().catch(() => {});
+    }
+    if (this.state.bargeInWs && this.state.bargeInWs.readyState < WebSocket.CLOSING) {
+      try {
+        if (this.state.bargeInWs.readyState === WebSocket.OPEN) {
+          this.state.bargeInWs.send(JSON.stringify({ type: "stop" }));
+        }
+        this.state.bargeInWs.close();
+      } catch (_err) {
+        // Ignore close races while tearing down barge-in monitoring.
+      }
+    }
+    this.state.bargeInWs = null;
+    this.state.bargeInStream = null;
+    this.state.bargeInAudioContext = null;
+    this.state.bargeInSource = null;
+    this.state.bargeInNode = null;
+    this.state.bargeInSink = null;
+    this.state.bargeInStartedAt = 0;
+    this.state.bargeInStarting = false;
+  }
+
+  onBargeInEvent(event, socket, generation) {
+    if (this.state.bargeInWs !== socket || generation !== this.state.playbackGeneration) return;
+    const data = JSON.parse(event.data);
+    switch (data.type) {
+      case "ready":
+      case "vad_ready":
+      case "vad_monitor_started":
+        this.log(`barge-in ${data.type}`);
+        break;
+      case "vad_speech_start":
+        if (performance.now() - this.state.bargeInStartedAt < Number(this.options.bargeInCooldownMs || 800)) {
+          this.log("barge-in ignored during cooldown");
+          return;
+        }
+        this.emit("bargeIn", { probability: data.probability, timeMs: data.time_ms });
+        this.bargeInAndRecord().catch((err) => {
+          this.log(`barge-in interrupt failed: ${err.message || err}`, "error");
+          this.setMode("idle");
+        });
+        break;
+      case "vad_error":
+      case "error":
+        this.log(`barge-in VAD error: ${data.message || data.type}`, "error");
+        this.stopBargeInMonitor();
+        break;
+      default:
+        break;
+    }
+  }
+
+  async bargeInAndRecord() {
+    if (!this.options.enableBargeIn || this.state.bargeInTriggered) return;
+    if (!this.state.audioPlaying && this.state.mode !== "speaking" && this.state.mode !== "finalizing") return;
+
+    this.state.bargeInTriggered = true;
+    this.state.interrupted = true;
+    const historyText = this.state.playedAssistantText.trim();
+    if (historyText) {
+      this.saveCurrentTurnHistory(historyText);
+    }
+    this.stopBargeInMonitor();
+    this.stopPlayback();
+    this.closeWs();
+    this.setMode("busy");
+    this.setStatus("检测到插话，开始录音", true);
+    this.setVoiceState("正在听你说");
+    this.log(`barge-in detected, saved_played_text=${historyText ? "yes" : "no"}`);
+    await this.startRecording();
   }
 
   async stopRecording() {
@@ -409,7 +592,14 @@ export class RealtimeAudioClient extends EventTarget {
         break;
       case "final_audio_delta":
         this.state.streamedAudioCount += 1;
-        this.enqueueAudio(data.audio_data_url, data.audio_index || this.state.streamedAudioCount);
+        this.enqueueAudio(
+          data.audio_data_url,
+          data.audio_index || this.state.streamedAudioCount,
+          data.history_text || data.speech_text || "",
+        );
+        if (this.state.mode === "finalizing") {
+          this.setMode("speaking");
+        }
         this.setVoiceState("正在播报中");
         this.log(`audio chunk ${data.audio_index || this.state.streamedAudioCount} received`);
         break;
@@ -462,6 +652,11 @@ export class RealtimeAudioClient extends EventTarget {
 
     if (this.hasPendingPlayback()) {
       this.setMode("speaking");
+      if (this.shouldStartBargeInMonitor()) {
+        this.startBargeInMonitor().catch((err) => {
+          this.log(`barge-in monitor error: ${err.message || err}`, "error");
+        });
+      }
     } else {
       this.saveCurrentTurnHistory(
         this.state.finalHistoryText || this.state.finalText || this.state.playedAssistantText || this.getDisplayedText(),
@@ -479,7 +674,7 @@ export class RealtimeAudioClient extends EventTarget {
   }
 
   closeWs() {
-    if (this.state.ws && this.state.ws.readyState === WebSocket.OPEN) {
+    if (this.state.ws && this.state.ws.readyState < WebSocket.CLOSING) {
       this.state.ws.close();
     }
   }
@@ -495,6 +690,12 @@ export class RealtimeAudioClient extends EventTarget {
 
   hasPendingPlayback() {
     return this.state.audioPlaying || this.state.audioQueue.length > 0;
+  }
+
+  shouldStartBargeInMonitor() {
+    if (!this.options.enableBargeIn) return false;
+    if (this.options.bargeInAfterFinalResultOnly && !this.state.finalReceived) return false;
+    return true;
   }
 
   async interruptAndRecord() {
@@ -514,6 +715,7 @@ export class RealtimeAudioClient extends EventTarget {
   }
 
   stopPlayback() {
+    this.stopBargeInMonitor();
     this.state.playbackGeneration += 1;
     if (this.state.currentAudio) {
       this.state.currentAudio.onended = null;
@@ -546,11 +748,12 @@ export class RealtimeAudioClient extends EventTarget {
   playNextAudio() {
     const next = this.state.audioQueue.shift();
     if (!next) {
+      this.stopBargeInMonitor();
       this.state.audioPlaying = false;
       this.state.currentAudio = null;
       if (this.state.finalReceived && !this.state.interrupted) {
         this.saveCurrentTurnHistory(
-          this.state.finalText || this.state.playedAssistantText || this.getDisplayedText(),
+          this.state.finalHistoryText || this.state.finalText || this.state.playedAssistantText || this.getDisplayedText(),
         );
         this.setMode("idle");
       }
@@ -559,6 +762,11 @@ export class RealtimeAudioClient extends EventTarget {
     }
     this.state.audioPlaying = true;
     this.setVoiceState("正在播报中");
+    if (this.shouldStartBargeInMonitor()) {
+      this.startBargeInMonitor().catch((err) => {
+        this.log(`barge-in monitor error: ${err.message || err}`, "error");
+      });
+    }
 
     if (this.options.useWebAudioPlayback) {
       const generation = this.state.playbackGeneration;
@@ -680,4 +888,9 @@ export class RealtimeAudioClient extends EventTarget {
 function defaultWebSocketUrl() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}/ws/audio`;
+}
+
+function defaultVadMonitorWebSocketUrl() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/ws/vad`;
 }

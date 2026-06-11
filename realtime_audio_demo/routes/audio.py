@@ -160,6 +160,57 @@ async def websocket_audio(websocket: WebSocket) -> None:
                 pass
 
 
+@router.websocket("/ws/vad")
+async def websocket_vad(websocket: WebSocket) -> None:
+    await websocket.accept()
+    session = AudioSession(websocket=websocket)
+    await send_event(session, "ready", {"session_id": session.session_id})
+
+    try:
+        while True:
+            try:
+                message = await websocket.receive()
+            except RuntimeError as exc:
+                if "disconnect message has been received" in str(exc):
+                    break
+                raise
+            if message.get("text") is not None:
+                await handle_vad_control_message(session, message["text"])
+            elif message.get("bytes") is not None:
+                await handle_vad_monitor_chunk(session, message["bytes"])
+    except WebSocketDisconnect:
+        session.stopped = True
+
+
+async def handle_vad_control_message(session: AudioSession, text: str) -> None:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        await send_event(session, "error", {"message": f"bad json: {exc}"})
+        return
+
+    event_type = payload.get("type")
+    if event_type == "start":
+        session.source_sample_rate = int(payload.get("sampleRate") or session.source_sample_rate)
+        await configure_vad(session, payload.get("vad") or payload)
+        await send_event(
+            session,
+            "vad_monitor_started",
+            {
+                "session_id": session.session_id,
+                "source_sample_rate": session.source_sample_rate,
+                "vad": "silero" if session.vad else "none",
+            },
+        )
+    elif event_type == "stop":
+        session.stopped = True
+        await send_event(session, "vad_monitor_stopped", {"session_id": session.session_id})
+    elif event_type == "ping":
+        await send_event(session, "pong", {"ts": time.time()})
+    else:
+        await send_event(session, "error", {"message": f"unknown control event: {event_type}"})
+
+
 async def handle_control_message(session: AudioSession, text: str) -> None:
     try:
         payload = json.loads(text)
@@ -173,6 +224,7 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
         session.prefill_ms = int(payload.get("prefillMs") or DEFAULT_PREFILL_MS)
         session.model = normalize_model_name(payload.get("model") or QWEN_MODEL)
         session.output_audio = bool(payload.get("outputAudio"))
+        session.stream_speech_audio = bool(payload.get("streamSpeechAudio"))
         await configure_vad(session, payload.get("vad"))
         skill_names = normalize_skill_names(payload.get("skillNames") or [])
         session.prompt, used_skills, missing_skills = compose_realtime_prompt(
@@ -194,6 +246,7 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
                 "skills": used_skills,
                 "missing_skills": missing_skills,
                 "output_audio": session.output_audio,
+                "stream_speech_audio": session.stream_speech_audio,
                 "vad": "silero" if session.vad else "none",
             },
         )
@@ -243,6 +296,58 @@ def should_buffer_component_candidate(text: str) -> bool:
     if not stripped:
         return True
     return stripped.startswith("{") or stripped.startswith("```")
+
+
+class SpeechTextChunker:
+    sentence_end_chars = "。！？!?；;\n"
+    soft_break_chars = "，,、 "
+
+    def __init__(self, *, min_chars: int = 12, max_chars: int = 80) -> None:
+        self.min_chars = min_chars
+        self.max_chars = max_chars
+        self.buffer = ""
+
+    def add(self, text: str) -> list[str]:
+        self.buffer += text
+        return self._drain(force=False)
+
+    def flush(self) -> list[str]:
+        return self._drain(force=True)
+
+    def _drain(self, *, force: bool) -> list[str]:
+        chunks: list[str] = []
+        while True:
+            sentence_end = self._first_sentence_end()
+            if sentence_end >= 0 and (sentence_end + 1 >= self.min_chars or len(self.buffer) >= self.max_chars):
+                chunks.append(self._take(sentence_end + 1))
+                continue
+
+            if len(self.buffer) >= self.max_chars:
+                chunks.append(self._take(self._soft_split_index()))
+                continue
+
+            break
+
+        if force and self.buffer.strip():
+            chunks.append(self._take(len(self.buffer)))
+        return [item for item in chunks if item]
+
+    def _first_sentence_end(self) -> int:
+        indexes = [self.buffer.find(char) for char in self.sentence_end_chars if char in self.buffer]
+        return min(indexes) if indexes else -1
+
+    def _soft_split_index(self) -> int:
+        head = self.buffer[: self.max_chars]
+        indexes = [head.rfind(char) for char in self.soft_break_chars]
+        index = max(indexes)
+        if index >= self.min_chars:
+            return index + 1
+        return self.max_chars
+
+    def _take(self, size: int) -> str:
+        chunk = self.buffer[:size].strip()
+        self.buffer = self.buffer[size:].lstrip()
+        return chunk
 
 
 async def resolve_component_output(
@@ -365,6 +470,14 @@ async def handle_audio_chunk(session: AudioSession, pcm_float32_bytes: bytes) ->
 
     if session.vad:
         await run_server_vad(session, pcm_float32_bytes)
+
+
+async def handle_vad_monitor_chunk(session: AudioSession, pcm_float32_bytes: bytes) -> None:
+    if session.stopped or not session.vad:
+        return
+    if len(pcm_float32_bytes) < 4:
+        return
+    await run_server_vad(session, pcm_float32_bytes)
 
 
 async def run_server_vad(session: AudioSession, pcm_float32_bytes: bytes) -> None:
@@ -537,6 +650,36 @@ async def finalize_session(session: AudioSession) -> None:
     )
 
 
+async def stream_speech_worker(session: AudioSession, speech_queue: asyncio.Queue[str | None]) -> int:
+    audio_count = 0
+    spoken_parts: list[str] = []
+
+    while True:
+        speech_text = await speech_queue.get()
+        try:
+            if speech_text is None:
+                return audio_count
+
+            audio_data_url = await synthesize_speech_audio(session.model, speech_text)
+            if not audio_data_url:
+                continue
+
+            audio_count += 1
+            spoken_parts.append(speech_text)
+            await send_event(
+                session,
+                "final_audio_delta",
+                {
+                    "audio_data_url": audio_data_url,
+                    "audio_index": audio_count,
+                    "speech_text": speech_text,
+                    "history_text": "".join(spoken_parts),
+                },
+            )
+        finally:
+            speech_queue.task_done()
+
+
 async def stream_final_session(
     session: AudioSession,
     payload: dict[str, Any],
@@ -557,6 +700,26 @@ async def stream_final_session(
     text_parts: list[str] = []
     buffered_for_component = True
     audio_count = 0
+    speech_chunker = SpeechTextChunker()
+    speech_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    stream_speech = session.output_audio and session.stream_speech_audio
+    speech_task = asyncio.create_task(stream_speech_worker(session, speech_queue)) if stream_speech else None
+    speech_finished = False
+
+    async def queue_speech_text(text: str) -> None:
+        if not stream_speech:
+            return
+        for speech_text in speech_chunker.add(text):
+            await speech_queue.put(speech_text)
+
+    async def finish_speech_worker() -> int:
+        nonlocal speech_finished
+        if not speech_task or speech_finished:
+            return 0
+        speech_finished = True
+        await speech_queue.put(None)
+        return await speech_task
+
     try:
         while True:
             item = await queue.get()
@@ -573,6 +736,7 @@ async def stream_final_session(
                         "latency_ms": int((time.perf_counter() - start) * 1000),
                     },
                 )
+                await finish_speech_worker()
                 return
 
             chunk = item.get("data")
@@ -585,8 +749,10 @@ async def stream_final_session(
                 if buffered_for_component and not should_buffer_component_candidate(current_text):
                     buffered_for_component = False
                     await send_event(session, "final_text_delta", {"text": current_text})
+                    await queue_speech_text(current_text)
                 elif not buffered_for_component:
                     await send_event(session, "final_text_delta", {"text": delta["text"]})
+                    await queue_speech_text(delta["text"])
             if delta["audio_data_url"]:
                 audio_count += 1
                 await send_event(
@@ -603,7 +769,16 @@ async def stream_final_session(
     text = "".join(text_parts).strip() or None
     text, component_call, component_result = await resolve_component_output(session, text)
     normalized = normalize_assistant_output(text)
-    audio_data_url = await synthesize_speech_audio(session.model, normalized.history_text) if session.output_audio else None
+
+    if stream_speech:
+        if not component_call:
+            for speech_text in speech_chunker.flush():
+                await speech_queue.put(speech_text)
+        audio_count += await finish_speech_worker()
+
+    audio_data_url = None
+    if session.output_audio and audio_count == 0:
+        audio_data_url = await synthesize_speech_audio(session.model, normalized.history_text)
     await send_event(
         session,
         "final_result",

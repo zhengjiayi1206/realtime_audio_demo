@@ -24,20 +24,21 @@ REQUEST_TIMEOUT = float(os.getenv("QWEN_REQUEST_TIMEOUT", "180"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "10"))
 STREAM_FINAL_OUTPUT = os.getenv("STREAM_FINAL_OUTPUT", "1").lower() not in {"0", "false", "off", "no"}
 SILERO_VAD_ENABLED = os.getenv("SILERO_VAD_ENABLED", "1").lower() not in {"0", "false", "off", "no"}
+SILERO_VAD_PRELOAD = os.getenv("SILERO_VAD_PRELOAD", "1").lower() not in {"0", "false", "off", "no"}
 SILERO_VAD_ONNX = os.getenv("SILERO_VAD_ONNX", "0").lower() in {"1", "true", "on", "yes"}
 SILERO_VAD_THRESHOLD = float(os.getenv("SILERO_VAD_THRESHOLD", "0.5"))
 SILERO_VAD_MIN_SPEECH_MS = int(os.getenv("SILERO_VAD_MIN_SPEECH_MS", "180"))
-SILERO_VAD_MIN_SILENCE_MS = int(os.getenv("SILERO_VAD_MIN_SILENCE_MS", "850"))
-SILERO_VAD_MAX_SPEECH_MS = int(os.getenv("SILERO_VAD_MAX_SPEECH_MS", "18000"))
+SILERO_VAD_MIN_SILENCE_MS = int(os.getenv("SILERO_VAD_MIN_SILENCE_MS", "450"))
+SILERO_VAD_MAX_SPEECH_MS = int(os.getenv("SILERO_VAD_MAX_SPEECH_MS", "30000"))
 SILERO_VAD_SPEECH_PAD_MS = int(os.getenv("SILERO_VAD_SPEECH_PAD_MS", "30"))
 REALTIME_DEFAULT_SKILLS = [
     item.strip() for item in os.getenv("REALTIME_DEFAULT_SKILLS", "").split(",") if item.strip()
 ]
 REALTIME_SKILL_MAX_CHARS = int(os.getenv("REALTIME_SKILL_MAX_CHARS", "12000"))
 DEFAULT_FINAL_PROMPT = (
-    "你正在进行实时语音对话。请不要转写、复述或翻译用户的语音内容。"
-    "请先理解用户语音里的意图，然后像聊天助手一样直接回答用户的问题。"
-    "请根据问题复杂度给出完整、有帮助的回答；只有在用户只是打招呼时才简短回应。"
+    "你正在和用户进行实时语音对话。请直接理解用户想问什么，不要转写、复述或翻译语音内容。"
+    "回答要像真人聊天一样自然、口语化、简短，优先用一两句话说清楚。"
+    "只有问题确实复杂时再分点说明；不要啰嗦，不要输出无关解释。"
 )
 DEFAULT_CHAT_PROMPT = os.getenv(
     "DEFAULT_CHAT_PROMPT",

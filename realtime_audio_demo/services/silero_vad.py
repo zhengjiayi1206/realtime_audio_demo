@@ -1,3 +1,5 @@
+import copy
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,10 +16,102 @@ from realtime_audio_demo.utils.audio import float32_bytes_to_list, resample_line
 
 SILERO_SAMPLE_RATE = 16000
 SILERO_WINDOW_SAMPLES = 512
+SILERO_DEVICE = "cpu"
 
 
 class SileroVadUnavailable(RuntimeError):
     pass
+
+
+class SileroVadModelFactory:
+    def __init__(self, *, use_onnx: bool) -> None:
+        self.use_onnx = use_onnx
+        self._torch: Any
+        self._base_model: Any
+        self._load_model()
+        self._warm_up()
+
+    @property
+    def torch(self) -> Any:
+        return self._torch
+
+    def new_model(self) -> Any:
+        try:
+            model = copy.deepcopy(self._base_model)
+        except Exception:
+            model = self._load_fresh_model()
+        if hasattr(model, "reset_states"):
+            model.reset_states()
+        return model
+
+    def _load_model(self) -> None:
+        self._torch = self._import_torch()
+        self._base_model = self._load_fresh_model()
+        if hasattr(self._base_model, "reset_states"):
+            self._base_model.reset_states()
+
+    def _load_fresh_model(self) -> Any:
+        try:
+            from silero_vad import load_silero_vad
+        except Exception as exc:  # pragma: no cover - depends on optional runtime deps
+            raise SileroVadUnavailable(
+                "silero-vad is not installed. Run `uv sync` or `pip install silero-vad` on the server."
+            ) from exc
+
+        try:
+            model = load_silero_vad(onnx=self.use_onnx)
+        except TypeError:
+            model = load_silero_vad()
+        if hasattr(model, "to"):
+            model.to(SILERO_DEVICE)
+        return model
+
+    def _warm_up(self) -> None:
+        if self.use_onnx:
+            return
+        model = self.new_model()
+        frame = self._torch.zeros(SILERO_WINDOW_SAMPLES, dtype=self._torch.float32, device=SILERO_DEVICE)
+        with self._torch.no_grad():
+            model(frame, SILERO_SAMPLE_RATE)
+        if hasattr(model, "reset_states"):
+            model.reset_states()
+
+    @staticmethod
+    def _import_torch() -> Any:
+        try:
+            import torch
+        except Exception as exc:  # pragma: no cover - depends on optional runtime deps
+            raise SileroVadUnavailable(
+                "torch is required by silero-vad. Run `uv sync` or `pip install silero-vad` on the server."
+            ) from exc
+        return torch
+
+
+_FACTORIES: dict[bool, SileroVadModelFactory] = {}
+_FACTORIES_LOCK = threading.Lock()
+
+
+def get_silero_vad_factory(*, use_onnx: bool) -> SileroVadModelFactory:
+    with _FACTORIES_LOCK:
+        factory = _FACTORIES.get(use_onnx)
+        if factory is None:
+            factory = SileroVadModelFactory(use_onnx=use_onnx)
+            _FACTORIES[use_onnx] = factory
+        return factory
+
+
+def preload_silero_vad(*, use_onnx: bool = SILERO_VAD_ONNX) -> dict[str, Any]:
+    get_silero_vad_factory(use_onnx=use_onnx)
+    return silero_vad_status()
+
+
+def silero_vad_status() -> dict[str, Any]:
+    with _FACTORIES_LOCK:
+        return {
+            "preloaded": bool(_FACTORIES),
+            "device": SILERO_DEVICE,
+            "onnx_modes": [str(key).lower() for key in sorted(_FACTORIES.keys())],
+        }
 
 
 @dataclass(frozen=True)
@@ -43,21 +137,9 @@ class SileroVadSession:
         self.reset()
 
     def _load_model(self) -> None:
-        try:
-            import torch
-            from silero_vad import load_silero_vad
-        except Exception as exc:  # pragma: no cover - depends on optional runtime deps
-            raise SileroVadUnavailable(
-                "silero-vad is not installed. Run `uv sync` or `pip install silero-vad` on the server."
-            ) from exc
-
-        self._torch = torch
-        try:
-            self._model = load_silero_vad(onnx=self.config.use_onnx)
-        except TypeError:
-            self._model = load_silero_vad()
-        if hasattr(self._model, "reset_states"):
-            self._model.reset_states()
+        factory = get_silero_vad_factory(use_onnx=self.config.use_onnx)
+        self._torch = factory.torch
+        self._model = factory.new_model()
 
     def reset(self) -> None:
         if hasattr(self._model, "reset_states"):
@@ -131,7 +213,7 @@ class SileroVadSession:
         return []
 
     def _speech_probability(self, frame: list[float]) -> float:
-        tensor = self._torch.tensor(frame, dtype=self._torch.float32)
+        tensor = self._torch.tensor(frame, dtype=self._torch.float32, device=SILERO_DEVICE)
         with self._torch.no_grad():
             return float(self._model(tensor, SILERO_SAMPLE_RATE).item())
 

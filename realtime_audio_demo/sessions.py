@@ -19,6 +19,7 @@ class AudioSession:
     prompt: str = DEFAULT_FINAL_PROMPT
     history: list[dict[str, str]] = field(default_factory=list)
     output_audio: bool = False
+    stream_speech_audio: bool = False
     prefill_ms: int = DEFAULT_PREFILL_MS
     chunks: list[bytes] = field(default_factory=list)
     prefill_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=asyncio.Queue)

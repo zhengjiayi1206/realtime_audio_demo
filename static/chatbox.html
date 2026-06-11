@@ -210,6 +210,27 @@
         gap: 8px;
       }
 
+      .call-button {
+        min-width: 104px;
+        height: 38px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        color: #475467;
+        padding: 0 14px;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+
+      .call-button.active {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+
       .icon-button {
         width: 38px;
         height: 38px;
@@ -553,6 +574,7 @@
               <span id="statusText">idle</span>
             </div>
             <div class="tool-buttons">
+              <button class="call-button" id="liveCallBtn" type="button" title="开始实时通话" aria-label="开始实时通话">实时通话</button>
               <button class="icon-button" id="voiceBtn" type="button" title="语音输入" aria-label="语音输入">🎙</button>
               <button class="send-button" id="sendBtn" type="button" title="发送文字" aria-label="发送文字">➤</button>
             </div>
@@ -615,6 +637,7 @@
         textInput: document.getElementById("textInput"),
         sendBtn: document.getElementById("sendBtn"),
         voiceBtn: document.getElementById("voiceBtn"),
+        liveCallBtn: document.getElementById("liveCallBtn"),
         statusDot: document.getElementById("statusDot"),
         statusText: document.getElementById("statusText"),
         sideStatusDot: document.getElementById("sideStatusDot"),
@@ -633,14 +656,39 @@
       let assistantBubble = null;
       let textBusy = false;
       let textAudio = null;
+      let autoConversation = false;
+      let restartTimer = null;
+      let startInFlight = false;
 
       const client = new RealtimeAudioClient({
+        useWebAudioPlayback: true,
+        enableBargeIn: true,
+        bargeInAfterFinalResultOnly: true,
+        bargeInChunkMs: 120,
+        bargeInCooldownMs: 900,
         getModel: () => modelName,
         getPrompt: () => realtimePrompt,
         getPrefillMs: () => 600,
         getDisplayedText: () => assistantBubble?.textContent || "",
         getSkillNames: selectedSkills,
         getOutputAudio: outputAudioEnabled,
+        getStreamSpeechAudio: outputAudioEnabled,
+        getVadConfig: () => ({
+          engine: "silero",
+          threshold: 0.5,
+          minSpeechMs: 180,
+          minSilenceMs: 450,
+          maxSpeechMs: 30000,
+          speechPadMs: 30,
+        }),
+        getBargeInVadConfig: () => ({
+          engine: "silero",
+          threshold: 0.92,
+          minSpeechMs: 350,
+          minSilenceMs: 650,
+          maxSpeechMs: 6000,
+          speechPadMs: 30,
+        }),
       });
 
       client.on("config", ({ config }) => {
@@ -653,6 +701,11 @@
       client.on("mode", ({ mode }) => {
         currentMode = mode;
         updateVoiceButton(mode);
+        updateLiveCallButton(mode);
+        updateTextControls();
+        if (mode === "idle" && autoConversation) {
+          scheduleRestart();
+        }
       });
 
       client.on("status", ({ text, ok }) => {
@@ -699,9 +752,36 @@
         if (level === "error") setStatus("请求异常", false);
       });
 
+      client.on("bargeIn", () => {
+        setStatus("检测到插话，开始录音", true);
+      });
+
+      els.liveCallBtn.addEventListener("click", async () => {
+        els.liveCallBtn.disabled = true;
+        try {
+          if (autoConversation) {
+            stopRealtimeConversation();
+          } else {
+            await startRealtimeConversation();
+          }
+        } catch (err) {
+          autoConversation = false;
+          clearRestartTimer();
+          setStatus(err.message || String(err), false);
+          client.setMode("idle");
+        } finally {
+          updateLiveCallButton(currentMode);
+          updateTextControls();
+        }
+      });
+
       els.voiceBtn.addEventListener("click", async () => {
         els.voiceBtn.disabled = true;
         try {
+          if (autoConversation) {
+            setStatus("请先结束实时通话", false);
+            return;
+          }
           stopTextAudio();
           await client.handleAction();
         } catch (err) {
@@ -746,6 +826,10 @@
       async function sendTextMessage() {
         const text = els.textInput.value.trim();
         if (!text || textBusy) return;
+        if (autoConversation) {
+          setStatus("请先结束实时通话", false);
+          return;
+        }
         if (currentMode === "recording" || currentMode === "busy") {
           setStatus("请先停止当前语音输入", false);
           return;
@@ -900,8 +984,12 @@
       }
 
       function clearConversation() {
+        autoConversation = false;
+        startInFlight = false;
+        clearRestartTimer();
         stopTextAudio();
         client.stopPlayback();
+        client.stopBargeInMonitor();
         client.stopInputDevices();
         client.closeWs();
         client.state.history = [];
@@ -914,17 +1002,27 @@
       function updateVoiceButton(mode) {
         const active = mode === "recording" || mode === "finalizing" || mode === "speaking";
         els.voiceBtn.classList.toggle("active", active);
-        els.voiceBtn.disabled = mode === "busy" || textBusy;
+        els.voiceBtn.disabled = mode === "busy" || textBusy || autoConversation;
         els.voiceBtn.textContent =
           mode === "recording" ? "■" : mode === "finalizing" || mode === "speaking" ? "↯" : "🎙";
         els.voiceBtn.title =
           mode === "recording" ? "停止并推理" : mode === "finalizing" || mode === "speaking" ? "打断" : "语音输入";
       }
 
+      function updateLiveCallButton(mode) {
+        const active = autoConversation;
+        els.liveCallBtn.classList.toggle("active", active);
+        els.liveCallBtn.disabled = textBusy || startInFlight || mode === "busy";
+        els.liveCallBtn.textContent = active ? "结束通话" : "实时通话";
+        els.liveCallBtn.title = active ? "结束实时通话" : "开始实时通话";
+      }
+
       function updateTextControls() {
-        els.sendBtn.disabled = textBusy;
-        els.textInput.disabled = textBusy;
+        const disabled = textBusy || autoConversation;
+        els.sendBtn.disabled = disabled;
+        els.textInput.disabled = disabled;
         updateVoiceButton(currentMode);
+        updateLiveCallButton(currentMode);
       }
 
       function setStatus(text, ok) {
@@ -1022,12 +1120,75 @@
         textAudio = null;
       }
 
+      async function startRealtimeConversation() {
+        if (startInFlight || autoConversation) return;
+        startInFlight = true;
+        autoConversation = true;
+        stopTextAudio();
+        client.stopPlayback();
+        client.setMode("busy");
+        client.setVoiceState("准备中");
+        updateTextControls();
+        try {
+          await client.unlockAudioOutput();
+          if (!autoConversation) return;
+          await client.startRecording();
+        } catch (err) {
+          autoConversation = false;
+          clearRestartTimer();
+          client.setMode("idle");
+          client.setVoiceState("倾听中");
+          throw err;
+        } finally {
+          startInFlight = false;
+          updateLiveCallButton(client.state.mode);
+          updateTextControls();
+        }
+      }
+
+      function stopRealtimeConversation() {
+        autoConversation = false;
+        startInFlight = false;
+        clearRestartTimer();
+        stopTextAudio();
+        client.stopPlayback();
+        client.stopBargeInMonitor();
+        client.stopInputDevices();
+        client.closeWs();
+        client.setMode("idle");
+        client.setVoiceState("倾听中");
+        updateLiveCallButton("idle");
+        updateTextControls();
+      }
+
+      function scheduleRestart() {
+        if (restartTimer || !autoConversation || client.state.mode !== "idle") return;
+        restartTimer = setTimeout(() => {
+          restartTimer = null;
+          if (!autoConversation || client.state.mode !== "idle") return;
+          client.startRecording().catch((err) => {
+            autoConversation = false;
+            client.setMode("idle");
+            client.setVoiceState("倾听中");
+            setStatus(err.message || String(err), false);
+            updateTextControls();
+          });
+        }, 550);
+      }
+
+      function clearRestartTimer() {
+        if (!restartTimer) return;
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+
       function scrollToBottom() {
         els.conversation.scrollTop = els.conversation.scrollHeight;
       }
 
       client.loadServerConfig().catch((err) => setStatus(err.message || String(err), false));
       loadSkills().catch((err) => setStatus(err.message || String(err), false));
+      updateLiveCallButton("idle");
     </script>
   </body>
 </html>

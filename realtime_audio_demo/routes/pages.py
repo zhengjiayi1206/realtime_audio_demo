@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from realtime_audio_demo.config import (
@@ -15,6 +15,7 @@ from realtime_audio_demo.config import (
     SILERO_VAD_MAX_SPEECH_MS,
     SILERO_VAD_MIN_SILENCE_MS,
     SILERO_VAD_MIN_SPEECH_MS,
+    SILERO_VAD_PRELOAD,
     SILERO_VAD_THRESHOLD,
     STATIC_DIR,
     STREAM_FINAL_OUTPUT,
@@ -22,6 +23,7 @@ from realtime_audio_demo.config import (
     resolved_provider,
 )
 from realtime_audio_demo.services.skill_loader import list_runtime_skills
+from realtime_audio_demo.services.silero_vad import silero_vad_status
 
 
 router = APIRouter()
@@ -61,7 +63,7 @@ async def realtime() -> RedirectResponse:
 
 
 @router.get("/health")
-async def health() -> JSONResponse:
+async def health(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "ok": True,
@@ -76,10 +78,13 @@ async def health() -> JSONResponse:
             "stream_final_output": STREAM_FINAL_OUTPUT,
             "silero_vad": {
                 "enabled": SILERO_VAD_ENABLED,
+                "preload": SILERO_VAD_PRELOAD,
                 "threshold": SILERO_VAD_THRESHOLD,
                 "min_speech_ms": SILERO_VAD_MIN_SPEECH_MS,
                 "min_silence_ms": SILERO_VAD_MIN_SILENCE_MS,
                 "max_speech_ms": SILERO_VAD_MAX_SPEECH_MS,
+                "status": silero_vad_status(),
+                "startup": getattr(request.app.state, "silero_vad", None),
             },
             "realtime_default_skills": REALTIME_DEFAULT_SKILLS,
             "default_prompt": DEFAULT_FINAL_PROMPT,

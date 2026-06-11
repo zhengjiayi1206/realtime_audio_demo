@@ -289,7 +289,7 @@
     </main>
 
     <script type="module">
-      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=demo-silero-vad-audio-20260611";
+      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=demo-vad-guard-20260611";
 
       const els = {
         actionBtn: document.getElementById("actionBtn"),
@@ -301,24 +301,38 @@
 
       let model = "";
       let prompt =
-        "你正在进行实时语音对话。请不要转写、复述或翻译用户的语音内容。请先理解用户语音里的意图，然后像聊天助手一样直接回答用户的问题。请根据问题复杂度给出完整、有帮助的回答；只有在用户只是打招呼时才简短回应。";
+        "你正在和用户进行实时语音对话。请直接理解用户想问什么，不要转写、复述或翻译语音内容。回答要像真人聊天一样自然、口语化、简短，优先用一两句话说清楚。只有问题确实复杂时再分点说明；不要啰嗦，不要输出无关解释。";
       let autoConversation = false;
       let restartTimer = null;
+      let startInFlight = false;
 
       const client = new RealtimeAudioClient({
-        recorderWorkletUrl: "/static/recorder-worklet.js?v=demo-silero-vad-audio-20260611",
+        recorderWorkletUrl: "/static/recorder-worklet.js?v=demo-vad-guard-20260611",
         useWebAudioPlayback: true,
+        enableBargeIn: true,
+        bargeInAfterFinalResultOnly: true,
+        bargeInChunkMs: 120,
+        bargeInCooldownMs: 900,
         getModel: () => model,
         getPrompt: () => prompt,
         getPrefillMs: () => 600,
         getDisplayedText: () => els.resultText.textContent,
         getOutputAudio: () => true,
+        getStreamSpeechAudio: () => true,
         getVadConfig: () => ({
           engine: "silero",
           threshold: 0.5,
           minSpeechMs: 180,
-          minSilenceMs: 850,
-          maxSpeechMs: 18000,
+          minSilenceMs: 450,
+          maxSpeechMs: 30000,
+          speechPadMs: 30,
+        }),
+        getBargeInVadConfig: () => ({
+          engine: "silero",
+          threshold: 0.92,
+          minSpeechMs: 350,
+          minSilenceMs: 650,
+          maxSpeechMs: 6000,
           speechPadMs: 30,
         }),
       });
@@ -362,6 +376,10 @@
           els.hint.hidden = true;
         }
       });
+      client.on("bargeIn", () => {
+        els.hint.hidden = true;
+        els.voiceState.textContent = "检测到插话";
+      });
       client.on("voiceState", ({ text }) => {
         els.voiceState.textContent = text;
       });
@@ -392,26 +410,35 @@
         }
       });
 
-      function startConversation() {
+      async function startConversation() {
+        if (startInFlight) return;
+        startInFlight = true;
         autoConversation = true;
         els.hint.hidden = false;
         els.resultText.textContent = "";
-        Promise.resolve()
-          .then(() => client.unlockAudioOutput())
-          .then(() => client.startRecording())
-          .catch((err) => {
+        client.setMode("busy");
+        client.setVoiceState("准备中");
+        try {
+          await client.unlockAudioOutput();
+          if (!autoConversation) return;
+          await client.startRecording();
+        } catch (err) {
             autoConversation = false;
             client.setMode("idle");
             client.setVoiceState("倾听中");
             console.error(err);
-          });
-        renderMode(client.state.mode);
+        } finally {
+          startInFlight = false;
+          renderMode(client.state.mode);
+        }
       }
 
       function stopConversation() {
         autoConversation = false;
+        startInFlight = false;
         clearRestartTimer();
         client.stopPlayback();
+        client.stopBargeInMonitor();
         client.stopInputDevices();
         client.closeWs();
         client.setMode("idle");
