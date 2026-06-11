@@ -1,0 +1,775 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chat</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f7fa;
+        --sidebar: #ffffff;
+        --panel: #ffffff;
+        --text: #182230;
+        --muted: #667085;
+        --line: #d8dee8;
+        --soft: #f8fafc;
+        --accent: #0f766e;
+        --accent-dark: #115e59;
+        --danger: #b42318;
+        --shadow: 0 16px 42px rgba(16, 24, 40, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      button,
+      textarea,
+      input {
+        font: inherit;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      button:disabled,
+      textarea:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .app {
+        height: 100vh;
+        display: grid;
+        grid-template-columns: 280px minmax(0, 1fr);
+        overflow: hidden;
+      }
+
+      .sidebar {
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        border-right: 1px solid var(--line);
+        background: var(--sidebar);
+      }
+
+      .sidebar-head {
+        padding: 16px;
+        border-bottom: 1px solid var(--line);
+        display: grid;
+        gap: 12px;
+      }
+
+      .sidebar-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .sidebar-title h1 {
+        margin: 0;
+        font-size: 18px;
+        letter-spacing: 0;
+      }
+
+      .new-button,
+      .send-button,
+      .ghost-button,
+      .session-delete {
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--text);
+      }
+
+      .new-button {
+        min-height: 40px;
+        color: #fff;
+        border-color: var(--accent);
+        background: var(--accent);
+      }
+
+      .new-button:hover,
+      .send-button:hover {
+        background: var(--accent-dark);
+      }
+
+      .sessions {
+        min-height: 0;
+        overflow: auto;
+        padding: 10px;
+      }
+
+      .session-item {
+        width: 100%;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 6px;
+        padding: 10px;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        background: transparent;
+        text-align: left;
+      }
+
+      .session-item.active {
+        border-color: #b9d9d5;
+        background: #eef8f7;
+      }
+
+      .session-text {
+        min-width: 0;
+        display: grid;
+        gap: 3px;
+      }
+
+      .session-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      .session-time {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .session-delete {
+        width: 28px;
+        height: 28px;
+        color: var(--muted);
+      }
+
+      .sidebar-foot {
+        border-top: 1px solid var(--line);
+        padding: 12px 16px;
+        color: var(--muted);
+        font-size: 12px;
+        display: grid;
+        gap: 8px;
+      }
+
+      .main {
+        min-width: 0;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+      }
+
+      .topbar {
+        min-height: 64px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 12px 24px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+        backdrop-filter: blur(10px);
+      }
+
+      .title-box {
+        min-width: 0;
+        display: grid;
+        gap: 3px;
+      }
+
+      .chat-title {
+        margin: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 18px;
+        letter-spacing: 0;
+      }
+
+      .chat-meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .top-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .ghost-button {
+        min-height: 36px;
+        padding: 0 12px;
+        color: #475467;
+      }
+
+      .ghost-button.danger {
+        color: var(--danger);
+      }
+
+      .messages {
+        min-height: 0;
+        overflow: auto;
+        padding: 28px 24px 18px;
+      }
+
+      .message-list {
+        width: min(900px, 100%);
+        margin: 0 auto;
+      }
+
+      .welcome {
+        min-height: 46vh;
+        display: grid;
+        place-items: center;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      .turn {
+        display: grid;
+        grid-template-columns: 36px minmax(0, 1fr);
+        gap: 12px;
+        margin-bottom: 20px;
+      }
+
+      .turn.user {
+        grid-template-columns: minmax(0, 1fr) 36px;
+      }
+
+      .avatar {
+        width: 36px;
+        height: 36px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: #edf1f7;
+        color: #344054;
+        font-size: 13px;
+        font-weight: 750;
+      }
+
+      .turn.user .avatar {
+        grid-column: 2;
+        background: #eef8f7;
+        color: var(--accent);
+      }
+
+      .bubble {
+        min-width: 0;
+        width: fit-content;
+        max-width: 100%;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: 0 8px 22px rgba(16, 24, 40, 0.05);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        line-height: 1.65;
+      }
+
+      .turn.user .bubble {
+        justify-self: end;
+        background: #eef8f7;
+        border-color: #b9d9d5;
+      }
+
+      .bubble.pending {
+        color: var(--muted);
+      }
+
+      .bubble.error {
+        color: var(--danger);
+        border-color: #fecdca;
+        background: #fff6f5;
+      }
+
+      .composer-wrap {
+        padding: 12px 24px 22px;
+        background: linear-gradient(rgba(245, 247, 250, 0), var(--bg) 20%);
+      }
+
+      .composer {
+        width: min(900px, 100%);
+        margin: 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .composer textarea {
+        width: 100%;
+        min-height: 74px;
+        max-height: 220px;
+        resize: none;
+        border: 0;
+        outline: none;
+        padding: 15px 16px 8px;
+        color: var(--text);
+        background: transparent;
+      }
+
+      .composer textarea::placeholder {
+        color: #98a2b3;
+      }
+
+      .composer-bar {
+        min-height: 50px;
+        padding: 6px 10px 10px 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .status {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .send-button {
+        min-width: 76px;
+        min-height: 38px;
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #fff;
+      }
+
+      @media (max-width: 820px) {
+        .app {
+          grid-template-columns: 1fr;
+        }
+
+        .sidebar {
+          display: none;
+        }
+
+        .topbar,
+        .messages,
+        .composer-wrap {
+          padding-left: 12px;
+          padding-right: 12px;
+        }
+
+        .turn,
+        .turn.user {
+          grid-template-columns: 32px minmax(0, 1fr);
+        }
+
+        .turn.user .avatar {
+          grid-column: 1;
+        }
+
+        .turn.user .bubble {
+          justify-self: start;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="sidebar-title">
+            <h1>Chat</h1>
+          </div>
+          <button class="new-button" id="newChatBtn" type="button">新建对话</button>
+        </div>
+
+        <div class="sessions" id="sessions"></div>
+
+        <div class="sidebar-foot">
+          <span id="storageText">本地保存</span>
+          <button class="ghost-button danger" id="clearAllBtn" type="button">清空全部</button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="title-box">
+            <h2 class="chat-title" id="chatTitle">新对话</h2>
+            <div class="chat-meta" id="chatMeta">local session</div>
+          </div>
+          <div class="top-actions">
+            <button class="ghost-button" id="renameBtn" type="button">重命名</button>
+            <button class="ghost-button danger" id="deleteBtn" type="button">删除</button>
+          </div>
+        </header>
+
+        <section class="messages" id="messages">
+          <div class="message-list" id="messageList"></div>
+        </section>
+
+        <section class="composer-wrap">
+          <div class="composer">
+            <textarea id="messageInput" rows="2" placeholder="输入消息..."></textarea>
+            <div class="composer-bar">
+              <span class="status" id="statusText">ready</span>
+              <button class="send-button" id="sendBtn" type="button">发送</button>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module">
+      const STORAGE_KEY = "qwen3_omni_chat_sessions_v1";
+      const MAX_TITLE_LENGTH = 28;
+
+      const els = {
+        sessions: document.getElementById("sessions"),
+        newChatBtn: document.getElementById("newChatBtn"),
+        clearAllBtn: document.getElementById("clearAllBtn"),
+        storageText: document.getElementById("storageText"),
+        chatTitle: document.getElementById("chatTitle"),
+        chatMeta: document.getElementById("chatMeta"),
+        renameBtn: document.getElementById("renameBtn"),
+        deleteBtn: document.getElementById("deleteBtn"),
+        messages: document.getElementById("messages"),
+        messageList: document.getElementById("messageList"),
+        messageInput: document.getElementById("messageInput"),
+        sendBtn: document.getElementById("sendBtn"),
+        statusText: document.getElementById("statusText"),
+      };
+
+      let modelName = "";
+      let chatPrompt = "";
+      let maxHistoryTurns = 10;
+      let busy = false;
+      let store = loadStore();
+
+      ensureActiveSession();
+      render();
+
+      loadConfig().catch((err) => setStatus(err.message || String(err)));
+
+      els.newChatBtn.addEventListener("click", () => {
+        createSession();
+        render();
+      });
+
+      els.clearAllBtn.addEventListener("click", () => {
+        store = { activeId: null, sessions: [] };
+        ensureActiveSession();
+        persist();
+        render();
+      });
+
+      els.deleteBtn.addEventListener("click", () => {
+        deleteSession(store.activeId);
+      });
+
+      els.renameBtn.addEventListener("click", () => {
+        const session = activeSession();
+        if (!session) return;
+        const next = window.prompt("对话名称", session.title);
+        if (next === null) return;
+        session.title = cleanTitle(next) || "新对话";
+        session.updatedAt = Date.now();
+        persist();
+        render();
+      });
+
+      els.sendBtn.addEventListener("click", sendMessage);
+
+      els.messageInput.addEventListener("input", () => {
+        resizeInput();
+      });
+
+      els.messageInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          sendMessage();
+        }
+      });
+
+      async function loadConfig() {
+        const response = await fetch("/health");
+        if (!response.ok) throw new Error(`health failed: ${response.status}`);
+        const config = await response.json();
+        modelName = config.model || "";
+        chatPrompt = config.default_chat_prompt || "";
+        maxHistoryTurns = Number(config.max_history_turns || 10);
+        setStatus(`model ${modelName || "default"}`);
+      }
+
+      async function sendMessage() {
+        const text = els.messageInput.value.trim();
+        if (!text || busy) return;
+
+        const session = activeSession();
+        const history = requestHistory(session);
+        const userMessage = makeMessage("user", text);
+        const assistantMessage = makeMessage("assistant", "正在生成...", { pending: true });
+        session.messages.push(userMessage, assistantMessage);
+        if (!session.title || session.title === "新对话") {
+          session.title = summarizeTitle(text);
+        }
+        session.updatedAt = Date.now();
+        els.messageInput.value = "";
+        resizeInput();
+        busy = true;
+        setStatus("thinking");
+        persist();
+        render();
+
+        try {
+          const response = await fetch("/api/chat/text", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text,
+              model: modelName,
+              prompt: chatPrompt,
+              history,
+            }),
+          });
+          const raw = await response.text();
+          const data = parseJson(raw);
+          if (!response.ok) {
+            throw new Error(data.message || data.detail || raw.slice(0, 500) || `request failed: ${response.status}`);
+          }
+
+          assistantMessage.content = data.text || "服务端没有返回文本。";
+          assistantMessage.pending = false;
+          assistantMessage.error = false;
+          setStatus(`done ${data.latency_ms || 0}ms`);
+        } catch (err) {
+          assistantMessage.content = err.message || String(err);
+          assistantMessage.pending = false;
+          assistantMessage.error = true;
+          setStatus("request error");
+        } finally {
+          session.updatedAt = Date.now();
+          busy = false;
+          persist();
+          render();
+        }
+      }
+
+      function render() {
+        renderSessions();
+        renderHeader();
+        renderMessages();
+        els.sendBtn.disabled = busy;
+        els.messageInput.disabled = busy;
+      }
+
+      function renderSessions() {
+        const sessions = [...store.sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+        els.sessions.innerHTML = "";
+        for (const session of sessions) {
+          const row = document.createElement("button");
+          row.className = `session-item ${session.id === store.activeId ? "active" : ""}`;
+          row.type = "button";
+          row.addEventListener("click", () => {
+            store.activeId = session.id;
+            persist();
+            render();
+          });
+
+          const text = document.createElement("span");
+          text.className = "session-text";
+          const name = document.createElement("span");
+          name.className = "session-name";
+          name.textContent = session.title || "新对话";
+          const time = document.createElement("span");
+          time.className = "session-time";
+          time.textContent = formatTime(session.updatedAt);
+          text.appendChild(name);
+          text.appendChild(time);
+
+          const del = document.createElement("button");
+          del.className = "session-delete";
+          del.type = "button";
+          del.textContent = "×";
+          del.addEventListener("click", (event) => {
+            event.stopPropagation();
+            deleteSession(session.id);
+          });
+
+          row.appendChild(text);
+          row.appendChild(del);
+          els.sessions.appendChild(row);
+        }
+        els.storageText.textContent = `${store.sessions.length} 个本地会话`;
+      }
+
+      function renderHeader() {
+        const session = activeSession();
+        els.chatTitle.textContent = session?.title || "新对话";
+        const count = session?.messages?.filter((item) => item.role === "user").length || 0;
+        els.chatMeta.textContent = `${count} 轮对话，本地保存`;
+      }
+
+      function renderMessages() {
+        const session = activeSession();
+        els.messageList.innerHTML = "";
+        if (!session || !session.messages.length) {
+          const welcome = document.createElement("div");
+          welcome.className = "welcome";
+          welcome.textContent = "开始一个新的问题";
+          els.messageList.appendChild(welcome);
+          return;
+        }
+
+        for (const message of session.messages) {
+          const turn = document.createElement("div");
+          turn.className = `turn ${message.role}`;
+
+          const avatar = document.createElement("div");
+          avatar.className = "avatar";
+          avatar.textContent = message.role === "user" ? "我" : "AI";
+
+          const bubble = document.createElement("div");
+          bubble.className = `bubble ${message.pending ? "pending" : ""} ${message.error ? "error" : ""}`;
+          bubble.textContent = message.content;
+
+          if (message.role === "user") {
+            turn.appendChild(bubble);
+            turn.appendChild(avatar);
+          } else {
+            turn.appendChild(avatar);
+            turn.appendChild(bubble);
+          }
+          els.messageList.appendChild(turn);
+        }
+        requestAnimationFrame(() => {
+          els.messages.scrollTop = els.messages.scrollHeight;
+        });
+      }
+
+      function createSession(title = "新对话") {
+        const session = {
+          id: makeId(),
+          title,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          messages: [],
+        };
+        store.sessions.unshift(session);
+        store.activeId = session.id;
+        persist();
+        return session;
+      }
+
+      function deleteSession(id) {
+        store.sessions = store.sessions.filter((session) => session.id !== id);
+        if (store.activeId === id) {
+          store.activeId = store.sessions[0]?.id || null;
+        }
+        ensureActiveSession();
+        persist();
+        render();
+      }
+
+      function activeSession() {
+        return store.sessions.find((session) => session.id === store.activeId) || store.sessions[0];
+      }
+
+      function ensureActiveSession() {
+        if (!store.sessions.length) {
+          createSession();
+          return;
+        }
+        if (!store.sessions.some((session) => session.id === store.activeId)) {
+          store.activeId = store.sessions[0].id;
+          persist();
+        }
+      }
+
+      function requestHistory(session) {
+        const messages = (session?.messages || [])
+          .filter((item) => !item.pending && !item.error && ["user", "assistant"].includes(item.role))
+          .map((item) => ({ role: item.role, content: item.content }));
+        const limit = Math.max(0, maxHistoryTurns * 2);
+        return limit ? messages.slice(-limit) : messages;
+      }
+
+      function makeMessage(role, content, extra = {}) {
+        return {
+          id: makeId(),
+          role,
+          content,
+          createdAt: Date.now(),
+          ...extra,
+        };
+      }
+
+      function loadStore() {
+        try {
+          const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "");
+          if (parsed && Array.isArray(parsed.sessions)) {
+            return {
+              activeId: parsed.activeId || null,
+              sessions: parsed.sessions.filter((item) => item && item.id && Array.isArray(item.messages)),
+            };
+          }
+        } catch {
+          // Ignore broken local storage and start fresh.
+        }
+        return { activeId: null, sessions: [] };
+      }
+
+      function persist() {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+      }
+
+      function makeId() {
+        if (crypto.randomUUID) return crypto.randomUUID();
+        return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+      }
+
+      function summarizeTitle(text) {
+        return cleanTitle(text).slice(0, MAX_TITLE_LENGTH) || "新对话";
+      }
+
+      function cleanTitle(text) {
+        return String(text || "").replace(/\s+/g, " ").trim();
+      }
+
+      function formatTime(value) {
+        const date = new Date(value || Date.now());
+        return date.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+      }
+
+      function parseJson(raw) {
+        if (!raw) return {};
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return {};
+        }
+      }
+
+      function resizeInput() {
+        els.messageInput.style.height = "auto";
+        els.messageInput.style.height = `${Math.min(220, els.messageInput.scrollHeight)}px`;
+      }
+
+      function setStatus(text) {
+        els.statusText.textContent = text;
+      }
+    </script>
+  </body>
+</html>

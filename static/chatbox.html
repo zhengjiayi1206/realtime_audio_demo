@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chatbox</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f8fb;
+        --panel: #ffffff;
+        --panel-soft: #f8fafc;
+        --text: #182230;
+        --muted: #667085;
+        --line: #d8dee8;
+        --accent: #c9573f;
+        --accent-dark: #ad4430;
+        --accent-soft: #fff1ec;
+        --danger: #b42318;
+        --shadow: 0 18px 46px rgba(16, 24, 40, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      button,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .app-shell {
+        height: 100vh;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 330px;
+        overflow: hidden;
+      }
+
+      .chat-main {
+        min-width: 0;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: 1fr auto auto;
+        padding: 28px 38px 22px;
+      }
+
+      .conversation {
+        min-height: 0;
+        overflow: auto;
+        padding: 14px 6px 24px;
+      }
+
+      .welcome {
+        height: 100%;
+        min-height: 300px;
+        display: grid;
+        place-items: center;
+        color: var(--muted);
+        font-size: 15px;
+      }
+
+      .message {
+        display: grid;
+        grid-template-columns: 34px minmax(0, 780px);
+        gap: 12px;
+        margin: 0 auto 22px;
+        width: min(920px, 100%);
+      }
+
+      .message.user {
+        grid-template-columns: minmax(0, 780px) 34px;
+      }
+
+      .avatar {
+        width: 34px;
+        height: 34px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: #edf1f7;
+        color: #344054;
+        font-size: 17px;
+        flex: 0 0 auto;
+      }
+
+      .message.user .avatar {
+        grid-column: 2;
+        background: #eef8f6;
+        color: #0f766e;
+      }
+
+      .bubble {
+        min-width: 0;
+        width: fit-content;
+        max-width: 100%;
+        border-radius: 8px;
+        padding: 12px 14px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        box-shadow: 0 8px 24px rgba(16, 24, 40, 0.05);
+      }
+
+      .message.user .bubble {
+        justify-self: end;
+        background: #eef8f7;
+        border-color: #b9d9d5;
+      }
+
+      .message.assistant .bubble.loading {
+        color: var(--muted);
+      }
+
+      .clear-row {
+        width: min(1160px, 100%);
+        margin: 0 auto 10px;
+        display: flex;
+        justify-content: flex-end;
+      }
+
+      .link-button {
+        border: 0;
+        background: transparent;
+        color: #4f6f9f;
+        padding: 4px 0;
+        font-size: 13px;
+      }
+
+      .composer {
+        width: min(1160px, 100%);
+        margin: 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .composer textarea {
+        width: 100%;
+        min-height: 96px;
+        max-height: 190px;
+        resize: vertical;
+        border: 0;
+        outline: none;
+        padding: 16px 18px 8px;
+        color: var(--text);
+        background: transparent;
+      }
+
+      .composer textarea::placeholder {
+        color: #98a2b3;
+      }
+
+      .composer-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 54px;
+        padding: 6px 12px 12px;
+      }
+
+      .input-modes {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #98a2b3;
+      }
+
+      .status-dot.ok {
+        background: #0f766e;
+      }
+
+      .tool-buttons {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .icon-button {
+        width: 38px;
+        height: 38px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        color: #475467;
+      }
+
+      .icon-button.active {
+        border-color: var(--accent);
+        color: var(--accent);
+        background: var(--accent-soft);
+      }
+
+      .send-button {
+        width: 40px;
+        height: 40px;
+        display: grid;
+        place-items: center;
+        border: 0;
+        border-radius: 50%;
+        color: #fff;
+        background: var(--accent);
+        font-size: 18px;
+      }
+
+      .send-button:hover {
+        background: var(--accent-dark);
+      }
+
+      .agent-panel {
+        min-height: 0;
+        border-left: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+        display: grid;
+        grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+        gap: 20px;
+        padding: 22px 20px;
+        overflow: auto;
+      }
+
+      .panel-close {
+        justify-self: end;
+        width: 34px;
+        height: 34px;
+        border: 0;
+        background: transparent;
+        color: #101828;
+        font-size: 30px;
+        line-height: 1;
+      }
+
+      .agent-summary {
+        display: grid;
+        justify-items: center;
+        text-align: center;
+        gap: 7px;
+      }
+
+      .agent-icon {
+        width: 70px;
+        height: 70px;
+        display: grid;
+        place-items: center;
+        border-radius: 18px;
+        background: linear-gradient(145deg, #d77966, #c64f3a);
+        color: #fff;
+        box-shadow: 0 18px 34px rgba(173, 68, 48, 0.24);
+        font-size: 32px;
+      }
+
+      .agent-summary h1 {
+        margin: 8px 0 0;
+        font-size: 18px;
+        letter-spacing: 0;
+      }
+
+      .agent-summary p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        margin-top: 6px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 5px 10px;
+        color: var(--muted);
+        font-size: 13px;
+        background: var(--panel-soft);
+      }
+
+      .skill-panel {
+        min-height: 0;
+        display: grid;
+        gap: 10px;
+      }
+
+      .option-panel {
+        display: grid;
+        gap: 10px;
+      }
+
+      .option-panel h2 {
+        margin: 0;
+        color: #344054;
+        font-size: 15px;
+        letter-spacing: 0;
+      }
+
+      .switch-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+        background: #fff;
+      }
+
+      .switch-copy {
+        display: grid;
+        gap: 2px;
+      }
+
+      .switch-copy strong {
+        font-size: 13px;
+      }
+
+      .switch-copy small {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .switch {
+        position: relative;
+        width: 42px;
+        height: 24px;
+        flex: 0 0 auto;
+      }
+
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+
+      .switch span {
+        position: absolute;
+        inset: 0;
+        border-radius: 999px;
+        background: #d0d5dd;
+        transition: background 160ms ease;
+      }
+
+      .switch span::before {
+        content: "";
+        position: absolute;
+        width: 18px;
+        height: 18px;
+        left: 3px;
+        top: 3px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 4px rgba(16, 24, 40, 0.2);
+        transition: transform 160ms ease;
+      }
+
+      .switch input:checked + span {
+        background: var(--accent);
+      }
+
+      .switch input:checked + span::before {
+        transform: translateX(18px);
+      }
+
+      .skill-panel h2 {
+        margin: 0;
+        color: #344054;
+        font-size: 15px;
+        letter-spacing: 0;
+      }
+
+      .skill-list {
+        display: grid;
+        gap: 8px;
+        max-height: 260px;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+        background: #fff;
+      }
+
+      .skill-empty {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+        padding: 4px 2px;
+      }
+
+      .skill-item {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 9px;
+        align-items: start;
+        border: 1px solid #edf1f7;
+        border-radius: 8px;
+        padding: 9px;
+        font-size: 13px;
+      }
+
+      .skill-item input {
+        width: 16px;
+        height: 16px;
+        margin-top: 2px;
+        accent-color: var(--accent);
+      }
+
+      .skill-meta {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .skill-meta strong {
+        overflow-wrap: anywhere;
+      }
+
+      .skill-meta small {
+        color: var(--muted);
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+      }
+
+      .side-actions {
+        display: grid;
+        gap: 10px;
+      }
+
+      .side-button {
+        min-height: 44px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #fff;
+        color: #475467;
+      }
+
+      .side-button.primary {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #fff;
+      }
+
+      .side-button.danger {
+        color: var(--danger);
+      }
+
+      .panel-hidden .agent-panel {
+        display: none;
+      }
+
+      .panel-hidden .app-shell {
+        grid-template-columns: 1fr;
+      }
+
+      @media (max-width: 920px) {
+        .app-shell {
+          grid-template-columns: 1fr;
+        }
+
+        .chat-main {
+          padding: 18px 12px;
+        }
+
+        .agent-panel {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+          max-height: 48vh;
+        }
+
+        .message,
+        .message.user {
+          grid-template-columns: 30px minmax(0, 1fr);
+        }
+
+        .message.user .avatar {
+          grid-column: 1;
+        }
+
+        .message.user .bubble {
+          justify-self: start;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <main class="chat-main">
+        <section class="conversation" id="conversation">
+          <div class="welcome">有什么可以帮你？</div>
+        </section>
+
+        <div class="clear-row">
+          <button class="link-button" id="clearBtn" type="button">清空页面历史对话</button>
+        </div>
+
+        <section class="composer">
+          <textarea id="textInput" rows="3" placeholder="输入想了解的问题..."></textarea>
+          <div class="composer-bar">
+            <div class="input-modes">
+              <span class="status-dot" id="statusDot"></span>
+              <span id="statusText">idle</span>
+            </div>
+            <div class="tool-buttons">
+              <button class="icon-button" id="voiceBtn" type="button" title="语音输入" aria-label="语音输入">🎙</button>
+              <button class="send-button" id="sendBtn" type="button" title="发送文字" aria-label="发送文字">➤</button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="agent-panel">
+        <button class="panel-close" id="closePanelBtn" type="button" aria-label="收起侧边栏">×</button>
+
+        <section class="agent-summary">
+          <div class="agent-icon">···</div>
+          <h1>Chatbox</h1>
+          <p>文字优先，语音可选</p>
+          <div class="status-pill">
+            <span class="status-dot" id="sideStatusDot"></span>
+            <span id="sideStatusText">idle</span>
+          </div>
+        </section>
+
+        <section class="option-panel">
+          <h2>输出设置</h2>
+          <label class="switch-row" for="outputVoiceSwitch">
+            <span class="switch-copy">
+              <strong>语音输出</strong>
+              <small>关闭时模型只返回文字</small>
+            </span>
+            <span class="switch">
+              <input id="outputVoiceSwitch" type="checkbox" />
+              <span aria-hidden="true"></span>
+            </span>
+          </label>
+        </section>
+
+        <section class="skill-panel">
+          <h2>Runtime skills</h2>
+          <div class="skill-list" id="skills">
+            <div class="skill-empty">未加载 runtime_skills</div>
+          </div>
+        </section>
+
+        <section class="side-actions">
+          <button class="side-button primary" id="newChatBtn" type="button">+ 开始新对话</button>
+          <button class="side-button danger" id="deleteChatBtn" type="button">删除聊天记录</button>
+        </section>
+      </aside>
+    </div>
+
+    <script type="module">
+      import { RealtimeAudioClient } from "/static/realtime-audio-client.js";
+
+      const els = {
+        conversation: document.getElementById("conversation"),
+        clearBtn: document.getElementById("clearBtn"),
+        textInput: document.getElementById("textInput"),
+        sendBtn: document.getElementById("sendBtn"),
+        voiceBtn: document.getElementById("voiceBtn"),
+        statusDot: document.getElementById("statusDot"),
+        statusText: document.getElementById("statusText"),
+        sideStatusDot: document.getElementById("sideStatusDot"),
+        sideStatusText: document.getElementById("sideStatusText"),
+        skills: document.getElementById("skills"),
+        newChatBtn: document.getElementById("newChatBtn"),
+        deleteChatBtn: document.getElementById("deleteChatBtn"),
+        closePanelBtn: document.getElementById("closePanelBtn"),
+        outputVoiceSwitch: document.getElementById("outputVoiceSwitch"),
+      };
+
+      let modelName = "";
+      let realtimePrompt = "";
+      let currentMode = "idle";
+      let assistantBubble = null;
+      let textBusy = false;
+      let textAudio = null;
+
+      const client = new RealtimeAudioClient({
+        getModel: () => modelName,
+        getPrompt: () => realtimePrompt,
+        getPrefillMs: () => 600,
+        getDisplayedText: () => assistantBubble?.textContent || "",
+        getSkillNames: selectedSkills,
+        getOutputAudio: outputAudioEnabled,
+      });
+
+      client.on("config", ({ config }) => {
+        modelName = config.model || "";
+        realtimePrompt = config.default_prompt || "";
+        client.state.maxHistoryTurns = Number(config.max_history_turns || 10);
+      });
+
+      client.on("mode", ({ mode }) => {
+        currentMode = mode;
+        updateVoiceButton(mode);
+      });
+
+      client.on("status", ({ text, ok }) => {
+        setStatus(text, Boolean(ok));
+      });
+
+      client.on("voiceState", ({ text }) => {
+        setStatus(text, currentMode !== "idle");
+      });
+
+      client.on("clearLog", () => {
+        if (currentMode === "recording" || currentMode === "busy") {
+          appendBubble("user", "语音输入中...");
+          assistantBubble = null;
+        }
+      });
+
+      client.on("result", ({ text, append, replace }) => {
+        if (replace && text === "录音中。") {
+          const lastUser = lastBubble("user");
+          if (lastUser) lastUser.textContent = "语音输入中...";
+          return;
+        }
+        if (replace && text === "模型输出中。") {
+          const lastUser = lastBubble("user");
+          if (lastUser && lastUser.textContent === "语音输入中...") lastUser.textContent = "语音输入已提交";
+          assistantBubble = appendBubble("assistant", "正在生成...");
+          assistantBubble.classList.add("loading");
+          return;
+        }
+        if (!assistantBubble) {
+          assistantBubble = appendBubble("assistant", "");
+        }
+        assistantBubble.classList.remove("loading");
+        if (append) {
+          assistantBubble.textContent += text || "";
+        } else if (replace) {
+          assistantBubble.textContent = text || "";
+        }
+        scrollToBottom();
+      });
+
+      client.on("log", ({ level }) => {
+        if (level === "error") setStatus("请求异常", false);
+      });
+
+      els.voiceBtn.addEventListener("click", async () => {
+        els.voiceBtn.disabled = true;
+        try {
+          stopTextAudio();
+          await client.handleAction();
+        } catch (err) {
+          setStatus(err.message || String(err), false);
+          client.setMode("idle");
+        } finally {
+          updateVoiceButton(currentMode);
+        }
+      });
+
+      els.sendBtn.addEventListener("click", sendTextMessage);
+
+      els.textInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          sendTextMessage();
+        }
+      });
+
+      els.clearBtn.addEventListener("click", clearConversation);
+      els.newChatBtn.addEventListener("click", clearConversation);
+      els.deleteChatBtn.addEventListener("click", clearConversation);
+      els.closePanelBtn.addEventListener("click", () => document.body.classList.toggle("panel-hidden"));
+      els.outputVoiceSwitch.addEventListener("change", () => {
+        if (!outputAudioEnabled()) {
+          stopTextAudio();
+          client.stopPlayback();
+        }
+      });
+
+      function selectedSkills() {
+        return [...els.skills.querySelectorAll("input[type='checkbox']:checked")].map((node) => node.value);
+      }
+
+      function outputAudioEnabled() {
+        return Boolean(els.outputVoiceSwitch.checked);
+      }
+
+      async function sendTextMessage() {
+        const text = els.textInput.value.trim();
+        if (!text || textBusy) return;
+        if (currentMode === "recording" || currentMode === "busy") {
+          setStatus("请先停止当前语音输入", false);
+          return;
+        }
+        if (currentMode === "finalizing" || currentMode === "speaking") {
+          client.stopPlayback();
+          client.closeWs();
+          client.setMode("idle");
+        }
+
+        stopTextAudio();
+        textBusy = true;
+        updateTextControls();
+        setStatus("文字输入中", true);
+        els.textInput.value = "";
+        appendBubble("user", text);
+        assistantBubble = appendBubble("assistant", "正在生成...");
+        assistantBubble.classList.add("loading");
+
+        try {
+          const response = await fetch("/api/chatbox/text", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text,
+              model: modelName,
+              prompt: realtimePrompt,
+              skillNames: selectedSkills(),
+              outputAudio: outputAudioEnabled(),
+              history: client.state.history,
+            }),
+          });
+          const raw = await response.text();
+          const data = parseJson(raw);
+          if (!response.ok) {
+            throw new Error(
+              data.message ||
+                data.detail ||
+                raw.slice(0, 500) ||
+                `request failed: ${response.status} ${response.statusText}`,
+            );
+          }
+
+          const answer = data.text || "服务端没有返回文本。";
+          assistantBubble.classList.remove("loading");
+          assistantBubble.textContent = answer;
+          client.rememberTextTurn(text, answer);
+          if (outputAudioEnabled() && data.audio_data_url) {
+            textAudio = new Audio(data.audio_data_url);
+            textAudio.play().catch(() => {});
+          }
+          setStatus("完成", true);
+        } catch (err) {
+          assistantBubble.classList.remove("loading");
+          assistantBubble.textContent = err.message || String(err);
+          setStatus("请求异常", false);
+        } finally {
+          textBusy = false;
+          updateTextControls();
+          scrollToBottom();
+        }
+      }
+
+      async function loadSkills() {
+        const response = await fetch("/api/chatbox/skills");
+        if (!response.ok) throw new Error(`skills load failed: ${response.status}`);
+        const data = await response.json();
+        const skills = data.skills || [];
+        const defaults = new Set(data.default_skills || []);
+        els.skills.innerHTML = "";
+
+        if (!skills.length) {
+          const empty = document.createElement("div");
+          empty.className = "skill-empty";
+          empty.textContent = "把公司内部 skill 放到 runtime_skills/<skill-name>/SKILL.md 后刷新";
+          els.skills.appendChild(empty);
+          return;
+        }
+
+        for (const skill of skills) {
+          const label = document.createElement("label");
+          label.className = "skill-item";
+
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.value = skill.name;
+          checkbox.checked = defaults.has(skill.name);
+
+          const meta = document.createElement("span");
+          meta.className = "skill-meta";
+          const name = document.createElement("strong");
+          name.textContent = skill.name;
+          const description = document.createElement("small");
+          description.textContent = skill.description || `${skill.chars || 0} chars`;
+          meta.appendChild(name);
+          meta.appendChild(description);
+
+          label.appendChild(checkbox);
+          label.appendChild(meta);
+          els.skills.appendChild(label);
+        }
+      }
+
+      function appendBubble(role, text) {
+        const welcome = els.conversation.querySelector(".welcome");
+        if (welcome) welcome.remove();
+
+        const message = document.createElement("div");
+        message.className = `message ${role}`;
+
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = role === "user" ? "人" : "AI";
+
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = text;
+
+        if (role === "user") {
+          message.appendChild(bubble);
+          message.appendChild(avatar);
+        } else {
+          message.appendChild(avatar);
+          message.appendChild(bubble);
+        }
+
+        els.conversation.appendChild(message);
+        scrollToBottom();
+        return bubble;
+      }
+
+      function lastBubble(role) {
+        const nodes = els.conversation.querySelectorAll(`.message.${role} .bubble`);
+        return nodes.length ? nodes[nodes.length - 1] : null;
+      }
+
+      function clearConversation() {
+        stopTextAudio();
+        client.stopPlayback();
+        client.stopInputDevices();
+        client.closeWs();
+        client.state.history = [];
+        assistantBubble = null;
+        els.conversation.innerHTML = '<div class="welcome">有什么可以帮你？</div>';
+        setStatus("idle", false);
+        client.setMode("idle");
+      }
+
+      function updateVoiceButton(mode) {
+        const active = mode === "recording" || mode === "finalizing" || mode === "speaking";
+        els.voiceBtn.classList.toggle("active", active);
+        els.voiceBtn.disabled = mode === "busy" || textBusy;
+        els.voiceBtn.textContent =
+          mode === "recording" ? "■" : mode === "finalizing" || mode === "speaking" ? "↯" : "🎙";
+        els.voiceBtn.title =
+          mode === "recording" ? "停止并推理" : mode === "finalizing" || mode === "speaking" ? "打断" : "语音输入";
+      }
+
+      function updateTextControls() {
+        els.sendBtn.disabled = textBusy;
+        els.textInput.disabled = textBusy;
+        updateVoiceButton(currentMode);
+      }
+
+      function setStatus(text, ok) {
+        els.statusText.textContent = text;
+        els.sideStatusText.textContent = text;
+        els.statusDot.classList.toggle("ok", Boolean(ok));
+        els.sideStatusDot.classList.toggle("ok", Boolean(ok));
+      }
+
+      function parseJson(raw) {
+        if (!raw) return {};
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return {};
+        }
+      }
+
+      function stopTextAudio() {
+        if (!textAudio) return;
+        textAudio.pause();
+        textAudio = null;
+      }
+
+      function scrollToBottom() {
+        els.conversation.scrollTop = els.conversation.scrollHeight;
+      }
+
+      client.loadServerConfig().catch((err) => setStatus(err.message || String(err), false));
+      loadSkills().catch((err) => setStatus(err.message || String(err), false));
+    </script>
+  </body>
+</html>

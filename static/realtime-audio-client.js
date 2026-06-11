@@ -8,6 +8,8 @@ export class RealtimeAudioClient extends EventTarget {
       getModel: () => "",
       getPrompt: () => "",
       getPrefillMs: () => 600,
+      getSkillNames: () => [],
+      getOutputAudio: () => false,
       ...options,
     };
     this.state = {
@@ -164,6 +166,8 @@ export class RealtimeAudioClient extends EventTarget {
         prefillMs: chunkMs,
         model: this.options.getModel().trim(),
         prompt: this.options.getPrompt().trim(),
+        skillNames: this.options.getSkillNames(),
+        outputAudio: Boolean(this.options.getOutputAudio()),
         history: this.state.history,
       }),
     );
@@ -211,6 +215,12 @@ export class RealtimeAudioClient extends EventTarget {
         this.log(
           `server started model=${data.model} api=${data.qwen_api_base} history=${data.history_messages || 0}`,
         );
+        if (Array.isArray(data.skills) && data.skills.length) {
+          this.log(`skills ${data.skills.join(", ")}`);
+        }
+        if (Array.isArray(data.missing_skills) && data.missing_skills.length) {
+          this.log(`missing skills ${data.missing_skills.join(", ")}`, "error");
+        }
         break;
       case "chunk_received":
         this.log(`chunk ${data.chunk_index} received, duration=${data.duration_ms}ms`);
@@ -397,14 +407,19 @@ export class RealtimeAudioClient extends EventTarget {
   rememberTurn(assistantText) {
     const text = (assistantText || "").trim();
     if (!text) return;
-    this.state.history.push({
-      role: "user",
-      content: "[用户上一轮通过语音输入了一条消息]",
-    });
-    this.state.history.push({
-      role: "assistant",
-      content: text,
-    });
+    this.appendHistoryTurn("[用户上一轮通过语音输入了一条消息]", text);
+  }
+
+  rememberTextTurn(userText, assistantText) {
+    const user = (userText || "").trim();
+    const assistant = (assistantText || "").trim();
+    if (!user || !assistant || assistant === "服务端没有返回文本。") return;
+    this.appendHistoryTurn(user, assistant);
+  }
+
+  appendHistoryTurn(userContent, assistantContent) {
+    this.state.history.push({ role: "user", content: userContent });
+    this.state.history.push({ role: "assistant", content: assistantContent });
     const maxMessages = Math.max(0, this.state.maxHistoryTurns * 2);
     if (maxMessages && this.state.history.length > maxMessages) {
       this.state.history = this.state.history.slice(-maxMessages);
