@@ -15,10 +15,17 @@ from realtime_audio_demo.config import (
     PREFILL_MODE,
     QWEN_API_BASE,
     QWEN_MODEL,
+    SILERO_VAD_ENABLED,
     STREAM_FINAL_OUTPUT,
     normalize_model_name,
 )
 from realtime_audio_demo.events import send_event
+from realtime_audio_demo.services.component_tools import (
+    call_component_tool,
+    extract_component_call,
+    format_component_result,
+)
+from realtime_audio_demo.services.output_filter import normalize_assistant_output
 from realtime_audio_demo.services.qwen import (
     build_chat_payload,
     extract_model_output,
@@ -28,12 +35,19 @@ from realtime_audio_demo.services.qwen import (
     stream_json_sync,
 )
 from realtime_audio_demo.services.skill_loader import compose_realtime_prompt
+from realtime_audio_demo.services.silero_vad import SileroVadConfig, SileroVadSession, SileroVadUnavailable
 from realtime_audio_demo.services.text_chat import request_text_completion
 from realtime_audio_demo.sessions import AudioSession
 from realtime_audio_demo.utils.audio import float32_sample_count, wav_bytes_from_float32_chunks
 
 
 router = APIRouter()
+
+
+SPEECH_PROMPT = (
+    "请把用户输入作为语音播报文本。"
+    "只按原文朗读，不要解释、不要改写、不要补充任何内容。"
+)
 
 
 @router.post("/api/realtime/text")
@@ -65,13 +79,55 @@ async def chatbox_text(request: Request) -> JSONResponse:
         prompt=prompt,
         history=history,
         max_tokens=FINAL_MAX_TOKENS,
-        output_audio=output_audio,
+        output_audio=False,
     )
     if status_code >= 400:
         return JSONResponse(result, status_code=status_code)
 
+    normalized = normalize_assistant_output(result.get("text"))
+    result["history_text"] = normalized.history_text
+    result["speech_text"] = normalized.history_text
+    result["output_is_json"] = normalized.is_json
     result.update({"skills": used_skills, "missing_skills": missing_skills, "output_audio": output_audio})
     return JSONResponse(result)
+
+
+@router.post("/api/chatbox/speech")
+async def chatbox_speech(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        return JSONResponse({"message": f"bad json: {exc}"}, status_code=400)
+
+    if not isinstance(payload, dict):
+        return JSONResponse({"message": "json body must be an object"}, status_code=400)
+
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"audio_data_url": None})
+
+    model = normalize_model_name(payload.get("model") or QWEN_MODEL)
+    audio_data_url = await synthesize_speech_audio(model, text)
+    return JSONResponse({"audio_data_url": audio_data_url})
+
+
+@router.post("/api/chatbox/components/call")
+async def chatbox_component_call(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        return JSONResponse({"message": f"bad json: {exc}"}, status_code=400)
+
+    if not isinstance(payload, dict):
+        return JSONResponse({"message": "json body must be an object"}, status_code=400)
+
+    component = str(payload.get("components") or "").strip()
+    params = payload.get("params") or {}
+    if not isinstance(params, dict):
+        return JSONResponse({"message": "params must be an object"}, status_code=400)
+
+    result, status_code = await call_component_tool(component, params)
+    return JSONResponse(result, status_code=status_code)
 
 
 @router.websocket("/ws/audio")
@@ -117,6 +173,7 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
         session.prefill_ms = int(payload.get("prefillMs") or DEFAULT_PREFILL_MS)
         session.model = normalize_model_name(payload.get("model") or QWEN_MODEL)
         session.output_audio = bool(payload.get("outputAudio"))
+        await configure_vad(session, payload.get("vad"))
         skill_names = normalize_skill_names(payload.get("skillNames") or [])
         session.prompt, used_skills, missing_skills = compose_realtime_prompt(
             payload.get("prompt") or session.prompt,
@@ -137,6 +194,7 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
                 "skills": used_skills,
                 "missing_skills": missing_skills,
                 "output_audio": session.output_audio,
+                "vad": "silero" if session.vad else "none",
             },
         )
     elif event_type == "stop":
@@ -161,6 +219,127 @@ def output_modalities(output_audio: bool) -> list[str]:
     return ["text", "audio"] if output_audio else ["text"]
 
 
+async def synthesize_speech_audio(model: str, text: str | None) -> str | None:
+    speech_text = (text or "").strip()
+    if not speech_text:
+        return None
+
+    result, status_code = await request_text_completion(
+        model=model,
+        text=speech_text,
+        prompt=SPEECH_PROMPT,
+        history=[],
+        max_tokens=FINAL_MAX_TOKENS,
+        output_audio=True,
+    )
+    if status_code >= 400:
+        return None
+    audio_data_url = result.get("audio_data_url")
+    return str(audio_data_url) if audio_data_url else None
+
+
+def should_buffer_component_candidate(text: str) -> bool:
+    stripped = text.lstrip()
+    if not stripped:
+        return True
+    return stripped.startswith("{") or stripped.startswith("```")
+
+
+async def resolve_component_output(
+    session: AudioSession,
+    text: str | None,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    component_call = extract_component_call(text)
+    if component_call is None:
+        return text, None, None
+
+    await send_event(session, "component_call_started", component_call)
+    result, status_code = await call_component_tool(component_call["components"], component_call["params"])
+    if status_code >= 400:
+        message = result.get("message") or f"component call failed: {status_code}"
+        return f"开户网点查询失败：{message}", component_call, result
+
+    return format_component_result(component_call["components"], result), component_call, result
+
+
+async def configure_vad(session: AudioSession, value: Any) -> None:
+    session.vad = None
+    if not isinstance(value, dict):
+        return
+
+    engine = str(value.get("engine") or "").strip().lower()
+    if engine not in {"silero", "server_silero"}:
+        return
+    if not SILERO_VAD_ENABLED:
+        await send_event(session, "vad_error", {"message": "Silero VAD is disabled by SILERO_VAD_ENABLED=0"})
+        return
+
+    defaults = SileroVadConfig()
+    config = SileroVadConfig(
+        threshold=clamp_float(value.get("threshold"), default=defaults.threshold, low=0.05, high=0.95),
+        min_speech_ms=clamp_int(value.get("minSpeechMs"), default=defaults.min_speech_ms, low=32, high=3000),
+        min_silence_ms=clamp_int(
+            value.get("minSilenceMs"),
+            default=defaults.min_silence_ms,
+            low=100,
+            high=5000,
+        ),
+        max_speech_ms=clamp_int(
+            value.get("maxSpeechMs"),
+            default=defaults.max_speech_ms,
+            low=1000,
+            high=120000,
+        ),
+        speech_pad_ms=clamp_int(value.get("speechPadMs"), default=defaults.speech_pad_ms, low=0, high=500),
+        use_onnx=parse_bool(value.get("onnx"), default=defaults.use_onnx),
+    )
+    try:
+        session.vad = await asyncio.to_thread(SileroVadSession, config)
+    except SileroVadUnavailable as exc:
+        await send_event(session, "vad_error", {"message": str(exc)})
+        return
+    except Exception as exc:
+        await send_event(session, "vad_error", {"message": f"Silero VAD load failed: {exc}"})
+        return
+
+    await send_event(
+        session,
+        "vad_ready",
+        {
+            "engine": "silero",
+            "sample_rate": 16000,
+            "threshold": config.threshold,
+            "min_speech_ms": config.min_speech_ms,
+            "min_silence_ms": config.min_silence_ms,
+            "max_speech_ms": config.max_speech_ms,
+        },
+    )
+
+
+def clamp_int(value: Any, *, default: int, low: int, high: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
+def clamp_float(value: Any, *, default: float, low: float, high: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
+def parse_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "on", "yes"}
+
+
 async def handle_audio_chunk(session: AudioSession, pcm_float32_bytes: bytes) -> None:
     if session.stopped:
         return
@@ -183,6 +362,29 @@ async def handle_audio_chunk(session: AudioSession, pcm_float32_bytes: bytes) ->
 
     if PREFILL_MODE != "off":
         await session.prefill_queue.put((chunk_index, pcm_float32_bytes))
+
+    if session.vad:
+        await run_server_vad(session, pcm_float32_bytes)
+
+
+async def run_server_vad(session: AudioSession, pcm_float32_bytes: bytes) -> None:
+    try:
+        vad_events = await asyncio.to_thread(
+            session.vad.process_chunk,
+            pcm_float32_bytes,
+            session.source_sample_rate,
+        )
+    except Exception as exc:
+        session.vad = None
+        await send_event(session, "vad_error", {"message": f"Silero VAD failed: {exc}"})
+        return
+
+    for item in vad_events:
+        event = item.get("event")
+        if event == "speech_start":
+            await send_event(session, "vad_speech_start", item)
+        elif event in {"speech_end", "max_speech"}:
+            await send_event(session, "vad_speech_end", item)
 
 
 async def prefill_worker(session: AudioSession) -> None:
@@ -277,7 +479,7 @@ async def finalize_session(session: AudioSession) -> None:
         session.prompt,
         history=session.history,
         max_tokens=FINAL_MAX_TOKENS,
-        modalities=output_modalities(session.output_audio),
+        modalities=["text"],
     )
     start = time.perf_counter()
 
@@ -314,12 +516,20 @@ async def finalize_session(session: AudioSession) -> None:
 
     data = response.json()
     parsed = extract_model_output(data)
+    text, component_call, component_result = await resolve_component_output(session, parsed["text"])
+    normalized = normalize_assistant_output(text)
+    audio_data_url = await synthesize_speech_audio(session.model, normalized.history_text) if session.output_audio else None
     await send_event(
         session,
         "final_result",
         {
-            "text": parsed["text"],
-            "audio_data_url": parsed["audio_data_url"],
+            "text": text,
+            "audio_data_url": audio_data_url,
+            "history_text": normalized.history_text,
+            "speech_text": normalized.history_text,
+            "output_is_json": normalized.is_json,
+            "component_call": component_call,
+            "component_result": component_result,
             "raw_response": data,
             "saved_input_wav": str(input_path),
             "latency_ms": latency_ms,
@@ -345,6 +555,7 @@ async def stream_final_session(
     )
 
     text_parts: list[str] = []
+    buffered_for_component = True
     audio_count = 0
     try:
         while True:
@@ -370,7 +581,12 @@ async def stream_final_session(
             delta = extract_stream_delta(chunk)
             if delta["text"]:
                 text_parts.append(delta["text"])
-                await send_event(session, "final_text_delta", {"text": delta["text"]})
+                current_text = "".join(text_parts)
+                if buffered_for_component and not should_buffer_component_candidate(current_text):
+                    buffered_for_component = False
+                    await send_event(session, "final_text_delta", {"text": current_text})
+                elif not buffered_for_component:
+                    await send_event(session, "final_text_delta", {"text": delta["text"]})
             if delta["audio_data_url"]:
                 audio_count += 1
                 await send_event(
@@ -385,13 +601,21 @@ async def stream_final_session(
         await task
 
     text = "".join(text_parts).strip() or None
+    text, component_call, component_result = await resolve_component_output(session, text)
+    normalized = normalize_assistant_output(text)
+    audio_data_url = await synthesize_speech_audio(session.model, normalized.history_text) if session.output_audio else None
     await send_event(
         session,
         "final_result",
         {
             "text": text,
-            "audio_data_url": None,
+            "audio_data_url": audio_data_url,
             "audio_chunks": audio_count,
+            "history_text": normalized.history_text,
+            "speech_text": normalized.history_text,
+            "output_is_json": normalized.is_json,
+            "component_call": component_call,
+            "component_result": component_result,
             "raw_response": None,
             "saved_input_wav": str(input_path),
             "latency_ms": int((time.perf_counter() - start) * 1000),

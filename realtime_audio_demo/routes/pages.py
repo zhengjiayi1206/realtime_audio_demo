@@ -11,6 +11,11 @@ from realtime_audio_demo.config import (
     QWEN_MODEL,
     QWEN_SPEAKER,
     REALTIME_DEFAULT_SKILLS,
+    SILERO_VAD_ENABLED,
+    SILERO_VAD_MAX_SPEECH_MS,
+    SILERO_VAD_MIN_SILENCE_MS,
+    SILERO_VAD_MIN_SPEECH_MS,
+    SILERO_VAD_THRESHOLD,
     STATIC_DIR,
     STREAM_FINAL_OUTPUT,
     TARGET_SAMPLE_RATE,
@@ -20,26 +25,34 @@ from realtime_audio_demo.services.skill_loader import list_runtime_skills
 
 
 router = APIRouter()
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+}
+
+
+def static_page(name: str) -> FileResponse:
+    return FileResponse(STATIC_DIR / name, headers=NO_CACHE_HEADERS)
 
 
 @router.get("/")
 async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return static_page("index.html")
 
 
 @router.get("/demo")
 async def demo() -> FileResponse:
-    return FileResponse(STATIC_DIR / "demo.html")
+    return static_page("demo.html")
 
 
 @router.get("/chatbox")
 async def chatbox() -> FileResponse:
-    return FileResponse(STATIC_DIR / "chatbox.html")
+    return static_page("chatbox.html")
 
 
 @router.get("/chat")
 async def chat() -> FileResponse:
-    return FileResponse(STATIC_DIR / "chat.html")
+    return static_page("chat.html")
 
 
 @router.get("/realtime")
@@ -61,6 +74,13 @@ async def health() -> JSONResponse:
             "target_sample_rate": TARGET_SAMPLE_RATE,
             "max_history_turns": MAX_HISTORY_TURNS,
             "stream_final_output": STREAM_FINAL_OUTPUT,
+            "silero_vad": {
+                "enabled": SILERO_VAD_ENABLED,
+                "threshold": SILERO_VAD_THRESHOLD,
+                "min_speech_ms": SILERO_VAD_MIN_SPEECH_MS,
+                "min_silence_ms": SILERO_VAD_MIN_SILENCE_MS,
+                "max_speech_ms": SILERO_VAD_MAX_SPEECH_MS,
+            },
             "realtime_default_skills": REALTIME_DEFAULT_SKILLS,
             "default_prompt": DEFAULT_FINAL_PROMPT,
             "default_chat_prompt": DEFAULT_CHAT_PROMPT,

@@ -23,6 +23,13 @@ FINAL_MAX_TOKENS = int(os.getenv("FINAL_MAX_TOKENS", "512"))
 REQUEST_TIMEOUT = float(os.getenv("QWEN_REQUEST_TIMEOUT", "180"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "10"))
 STREAM_FINAL_OUTPUT = os.getenv("STREAM_FINAL_OUTPUT", "1").lower() not in {"0", "false", "off", "no"}
+SILERO_VAD_ENABLED = os.getenv("SILERO_VAD_ENABLED", "1").lower() not in {"0", "false", "off", "no"}
+SILERO_VAD_ONNX = os.getenv("SILERO_VAD_ONNX", "0").lower() in {"1", "true", "on", "yes"}
+SILERO_VAD_THRESHOLD = float(os.getenv("SILERO_VAD_THRESHOLD", "0.5"))
+SILERO_VAD_MIN_SPEECH_MS = int(os.getenv("SILERO_VAD_MIN_SPEECH_MS", "180"))
+SILERO_VAD_MIN_SILENCE_MS = int(os.getenv("SILERO_VAD_MIN_SILENCE_MS", "850"))
+SILERO_VAD_MAX_SPEECH_MS = int(os.getenv("SILERO_VAD_MAX_SPEECH_MS", "18000"))
+SILERO_VAD_SPEECH_PAD_MS = int(os.getenv("SILERO_VAD_SPEECH_PAD_MS", "30"))
 REALTIME_DEFAULT_SKILLS = [
     item.strip() for item in os.getenv("REALTIME_DEFAULT_SKILLS", "").split(",") if item.strip()
 ]

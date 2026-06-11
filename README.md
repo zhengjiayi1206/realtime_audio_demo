@@ -71,6 +71,8 @@ http://127.0.0.1:55785/
 http://127.0.0.1:55785/demo
 ```
 
+`/demo` 页面使用后端 Silero VAD：点击“开始对话”后持续监听，后端检测到用户说完会通知前端自动停止本轮录音并请求模型输出，不需要再手动点“停止并推理”。Silero VAD 默认 `threshold=0.5`，约 `180ms` 连续语音判定开始说话，约 `850ms` 静默判定本轮说完；Qwen3-Omni 模型调用仍复用 `/ws/audio` 到 `QWEN_API_BASE/v1/chat/completions` 的原链路。
+
 普通文字问答页：
 
 ```text
@@ -125,18 +127,23 @@ TARGET_SAMPLE_RATE=16000
 FINAL_MAX_TOKENS=512
 MAX_HISTORY_TURNS=10
 STREAM_FINAL_OUTPUT=1
+SILERO_VAD_ENABLED=1
+SILERO_VAD_THRESHOLD=0.5
+SILERO_VAD_MIN_SPEECH_MS=180
+SILERO_VAD_MIN_SILENCE_MS=850
+SILERO_VAD_MAX_SPEECH_MS=18000
 RUNTIME_SKILLS_DIR=runtime_skills
 REALTIME_DEFAULT_SKILLS=
 REALTIME_SKILL_MAX_CHARS=12000
 ```
 
-页面会在当前浏览器标签页内保存多轮历史。再次点击“开始录音”时，前端会把历史消息发给后端；后端把历史放在当前音频消息之前再请求模型。历史默认最多保留 `MAX_HISTORY_TURNS` 轮，只保存文本上下文，不重复携带旧音频。
+页面会在当前浏览器标签页内保存多轮历史。再次开始录音时，前端会把历史消息发给后端；后端把历史放在当前音频消息之前再请求模型。历史默认最多保留 `MAX_HISTORY_TURNS` 轮，只保存文本上下文，不重复携带旧音频。
 
 `/chat` 是普通文字问答页面，适合日常像 ChatGPT 一样使用。它支持多个本地 session，会把会话列表和消息历史保存在浏览器 `localStorage`；服务端不保存这些聊天记录。每次请求时，前端只把当前 session 最近的文本历史发给 `/api/chat/text`。
 
 `STREAM_FINAL_OUTPUT=1` 时，最终推理会请求 vLLM-Omni streaming output；后端收到 text delta 后立即转发给前端。`/chatbox` 默认只请求文字输出，只有右侧“语音输出”开关打开时才会请求并播放 audio delta。若服务端不支持流式输出，可以设置 `STREAM_FINAL_OUTPUT=0` 回退到完整响应后显示。
 
-页面只有一个主交互按钮：空闲时是“开始录音”，录音中变为“停止并推理”，模型输出或播报时变为“打断”。打断后前端会立即停止当前播报、清空未播放音频，只把已经播完音频对应的文本前缀写入历史，然后开始新一轮录音。
+`/demo` 页面只有一个主交互按钮：空闲时是“开始对话”，开始后由 Silero VAD 自动判断本轮语音结束并推理，模型输出或播报结束后继续回到监听。再次点击按钮会结束对话并停止当前录音或播报。
 
 `/chatbox` 页面复用 `/demo` 的语音调用链路：浏览器录音分块发送到后端 `/ws/audio`，后端在停止录音后把整段音频合成 WAV，再请求 `QWEN_API_BASE/v1/chat/completions`。这个页面不使用 vLLM 的 `/v1/realtime` WebSocket 接口，只是在 `/demo` 基础上增加了 runtime skill 选择、底部文字/语音输入框和语音输出开关。旧 `/realtime` 路径会跳转到 `/chatbox`。
 
@@ -192,6 +199,7 @@ REALTIME_SKILL_MAX_CHARS=30000 bash ./run_demo.sh
 - `realtime_audio_demo/routes/chat.py`: 普通文字问答接口 `/api/chat/text`。
 - `realtime_audio_demo/routes/audio.py`: 实时语音 WebSocket 路由 `/ws/audio` 和 `/chatbox` 页面的文字输入接口 `/api/chatbox/text`。
 - `realtime_audio_demo/services/qwen.py`: Qwen OpenAI-compatible HTTP/SSE 请求和响应解析。
+- `realtime_audio_demo/services/silero_vad.py`: `/demo` 后端 Silero VAD 会话检测。
 - `realtime_audio_demo/services/text_chat.py`: 共享的文本问答请求封装。
 - `realtime_audio_demo/services/skill_loader.py`: `/chatbox` 页面运行时 skill 加载和 prompt 注入。
 - `realtime_audio_demo/utils/audio.py`: Float32 PCM、重采样和 WAV 转换工具。

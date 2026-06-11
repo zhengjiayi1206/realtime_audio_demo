@@ -6,5 +6,7 @@ captures/
 .env
 .env.*
 *.log
+*.pid
+*.pdf
 runtime_skills/*
 !runtime_skills/.gitkeep

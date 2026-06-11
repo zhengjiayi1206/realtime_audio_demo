@@ -4,8 +4,19 @@ class PCMChunker extends AudioWorkletProcessor {
     const processorOptions = options.processorOptions || {};
     this.chunkMs = Number(processorOptions.chunkMs || 600);
     this.chunkSamples = Math.max(128, Math.round((sampleRate * this.chunkMs) / 1000));
+    this.vadFrameMs = Number(processorOptions.vadFrameMs || 50);
+    this.vadFrameSamples = Math.max(128, Math.round((sampleRate * this.vadFrameMs) / 1000));
     this.pending = [];
     this.pendingSamples = 0;
+    this.vadEnergy = 0;
+    this.vadPeak = 0;
+    this.vadSamples = 0;
+
+    this.port.onmessage = (event) => {
+      if (event.data && event.data.type === "flush") {
+        this.flushPending();
+      }
+    };
   }
 
   process(inputs) {
@@ -32,6 +43,7 @@ class PCMChunker extends AudioWorkletProcessor {
 
     this.pending.push(mono);
     this.pendingSamples += mono.length;
+    this.updateVad(mono);
 
     while (this.pendingSamples >= this.chunkSamples) {
       const chunk = new Float32Array(this.chunkSamples);
@@ -56,6 +68,44 @@ class PCMChunker extends AudioWorkletProcessor {
     }
 
     return true;
+  }
+
+  updateVad(mono) {
+    for (let i = 0; i < mono.length; i += 1) {
+      const value = mono[i] || 0;
+      const abs = Math.abs(value);
+      this.vadEnergy += value * value;
+      this.vadPeak = Math.max(this.vadPeak, abs);
+    }
+    this.vadSamples += mono.length;
+
+    while (this.vadSamples >= this.vadFrameSamples) {
+      const rms = Math.sqrt(this.vadEnergy / Math.max(1, this.vadSamples));
+      this.port.postMessage({
+        type: "level",
+        rms,
+        peak: this.vadPeak,
+        durationMs: Math.round((this.vadSamples * 1000) / sampleRate),
+      });
+      this.vadEnergy = 0;
+      this.vadPeak = 0;
+      this.vadSamples = 0;
+    }
+  }
+
+  flushPending() {
+    if (this.pendingSamples > 0) {
+      const chunk = new Float32Array(this.pendingSamples);
+      let offset = 0;
+      while (this.pending.length > 0) {
+        const head = this.pending.shift();
+        chunk.set(head, offset);
+        offset += head.length;
+      }
+      this.pendingSamples = 0;
+      this.port.postMessage({ type: "chunk", pcm: chunk.buffer, flush: true }, [chunk.buffer]);
+    }
+    this.port.postMessage({ type: "flushed" });
   }
 }
 

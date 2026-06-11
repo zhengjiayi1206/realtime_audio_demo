@@ -248,7 +248,7 @@
         border-left: 1px solid var(--line);
         background: rgba(255, 255, 255, 0.86);
         display: grid;
-        grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+        grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
         gap: 20px;
         padding: 22px 20px;
         overflow: auto;
@@ -325,6 +325,25 @@
         color: #344054;
         font-size: 15px;
         letter-spacing: 0;
+      }
+
+      .system-textarea {
+        width: 100%;
+        min-height: 128px;
+        max-height: 260px;
+        resize: vertical;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+        background: #fff;
+        color: var(--text);
+        line-height: 1.5;
+        outline: none;
+      }
+
+      .system-textarea:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(201, 87, 63, 0.12);
       }
 
       .switch-row {
@@ -555,6 +574,11 @@
         </section>
 
         <section class="option-panel">
+          <h2>System</h2>
+          <textarea id="systemPromptInput" class="system-textarea" rows="5" placeholder="输入 system prompt..."></textarea>
+        </section>
+
+        <section class="option-panel">
           <h2>输出设置</h2>
           <label class="switch-row" for="outputVoiceSwitch">
             <span class="switch-copy">
@@ -600,6 +624,7 @@
         deleteChatBtn: document.getElementById("deleteChatBtn"),
         closePanelBtn: document.getElementById("closePanelBtn"),
         outputVoiceSwitch: document.getElementById("outputVoiceSwitch"),
+        systemPromptInput: document.getElementById("systemPromptInput"),
       };
 
       let modelName = "";
@@ -621,6 +646,7 @@
       client.on("config", ({ config }) => {
         modelName = config.model || "";
         realtimePrompt = config.default_prompt || "";
+        els.systemPromptInput.value = realtimePrompt;
         client.state.maxHistoryTurns = Number(config.max_history_turns || 10);
       });
 
@@ -644,7 +670,7 @@
         }
       });
 
-      client.on("result", ({ text, append, replace }) => {
+      client.on("result", ({ text, append, replace, loading }) => {
         if (replace && text === "录音中。") {
           const lastUser = lastBubble("user");
           if (lastUser) lastUser.textContent = "语音输入中...";
@@ -660,7 +686,7 @@
         if (!assistantBubble) {
           assistantBubble = appendBubble("assistant", "");
         }
-        assistantBubble.classList.remove("loading");
+        assistantBubble.classList.toggle("loading", Boolean(loading));
         if (append) {
           assistantBubble.textContent += text || "";
         } else if (replace) {
@@ -699,6 +725,9 @@
       els.newChatBtn.addEventListener("click", clearConversation);
       els.deleteChatBtn.addEventListener("click", clearConversation);
       els.closePanelBtn.addEventListener("click", () => document.body.classList.toggle("panel-hidden"));
+      els.systemPromptInput.addEventListener("input", () => {
+        realtimePrompt = els.systemPromptInput.value;
+      });
       els.outputVoiceSwitch.addEventListener("change", () => {
         if (!outputAudioEnabled()) {
           stopTextAudio();
@@ -745,7 +774,7 @@
               model: modelName,
               prompt: realtimePrompt,
               skillNames: selectedSkills(),
-              outputAudio: outputAudioEnabled(),
+              outputAudio: false,
               history: client.state.history,
             }),
           });
@@ -761,12 +790,29 @@
           }
 
           const answer = data.text || "服务端没有返回文本。";
-          assistantBubble.classList.remove("loading");
-          assistantBubble.textContent = answer;
-          client.rememberTextTurn(text, answer);
-          if (outputAudioEnabled() && data.audio_data_url) {
-            textAudio = new Audio(data.audio_data_url);
-            textAudio.play().catch(() => {});
+          const componentCall = parseComponentCall(answer);
+          if (componentCall) {
+            assistantBubble.textContent = "正在查询开户网点...";
+            setStatus("正在查询开户网点", true);
+            const componentResult = await callComponent(componentCall);
+            const rendered = JSON.stringify(componentResult, null, 2);
+            const normalized = normalizeAssistantOutput(rendered);
+            assistantBubble.classList.remove("loading");
+            assistantBubble.textContent = rendered;
+            client.rememberTextTurn(text, normalized.historyText);
+            if (outputAudioEnabled()) {
+              await playSpeechText(normalized.speechText).catch(() => setStatus("语音输出失败", false));
+            }
+          } else {
+            const normalized = normalizeAssistantOutput(answer);
+            const historyText = data.history_text ?? normalized.historyText;
+            const speechText = data.speech_text ?? normalized.speechText;
+            assistantBubble.classList.remove("loading");
+            assistantBubble.textContent = answer;
+            client.rememberTextTurn(text, historyText);
+            if (outputAudioEnabled()) {
+              await playSpeechText(speechText).catch(() => setStatus("语音输出失败", false));
+            }
           }
           setStatus("完成", true);
         } catch (err) {
@@ -886,6 +932,79 @@
         els.sideStatusText.textContent = text;
         els.statusDot.classList.toggle("ok", Boolean(ok));
         els.sideStatusDot.classList.toggle("ok", Boolean(ok));
+      }
+
+      function parseComponentCall(text) {
+        if (!text || !text.includes("call_10901558")) return null;
+        let params = {};
+        try {
+          const value = JSON.parse(text.trim());
+          if (value && value.params && typeof value.params === "object" && !Array.isArray(value.params)) {
+            params = value.params;
+          }
+        } catch {
+          params = {};
+        }
+        return {
+          components: "call_10901558",
+          params,
+        };
+      }
+
+      function normalizeAssistantOutput(text) {
+        const rawText = (text || "").trim();
+        if (!rawText) return { historyText: "", speechText: "", isJson: false };
+        try {
+          const value = JSON.parse(rawText);
+          if (value && typeof value === "object" && !Array.isArray(value)) {
+            const field = firstTextField(value, ["content", "soundsName"]);
+            return { historyText: field, speechText: field, isJson: true };
+          }
+          return { historyText: "", speechText: "", isJson: true };
+        } catch {
+          return { historyText: rawText, speechText: rawText, isJson: false };
+        }
+      }
+
+      function firstTextField(value, keys) {
+        for (const key of keys) {
+          if (typeof value[key] === "string" && value[key].trim()) return value[key].trim();
+        }
+        return "";
+      }
+
+      async function callComponent(componentCall) {
+        const response = await fetch("/api/chatbox/components/call", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(componentCall),
+        });
+        const raw = await response.text();
+        const data = parseJson(raw);
+        if (!response.ok) {
+          throw new Error(data.message || data.detail || raw.slice(0, 500) || `request failed: ${response.status}`);
+        }
+        return data;
+      }
+
+      async function playSpeechText(text) {
+        const speechText = (text || "").trim();
+        if (!speechText) return;
+        const response = await fetch("/api/chatbox/speech", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: speechText, model: modelName }),
+        });
+        const raw = await response.text();
+        const data = parseJson(raw);
+        if (!response.ok) {
+          throw new Error(data.message || data.detail || raw.slice(0, 500) || `speech failed: ${response.status}`);
+        }
+        if (data.audio_data_url) {
+          stopTextAudio();
+          textAudio = new Audio(data.audio_data_url);
+          await textAudio.play().catch(() => {});
+        }
       }
 
       function parseJson(raw) {

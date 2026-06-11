@@ -4,6 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/qwen3_omni_demo.log}"
 PID_FILE="${PID_FILE:-${SCRIPT_DIR}/qwen3_omni_demo.pid}"
+VENV_PY="${SCRIPT_DIR}/.venv/bin/python"
+
+if [[ ! -x "${VENV_PY}" ]]; then
+  echo "Cannot find project venv python: ${VENV_PY}" >&2
+  echo "Run 'uv sync' in ${SCRIPT_DIR} first." >&2
+  exit 1
+fi
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/uv-cache-${USER}}"
 export QWEN_API_BASE="${QWEN_API_BASE:-http://127.0.0.1:5440/v1}"
@@ -32,7 +39,7 @@ if [[ -f "${PID_FILE}" ]]; then
   fi
 fi
 
-nohup uv run uvicorn app:app --host "${HOST}" --port "${PORT}" > "${LOG_FILE}" 2>&1 &
+nohup "${VENV_PY}" -m uvicorn app:app --host "${HOST}" --port "${PORT}" > "${LOG_FILE}" 2>&1 &
 pid="$!"
 echo "${pid}" > "${PID_FILE}"
 

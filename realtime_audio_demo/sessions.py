@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import WebSocket
 
@@ -23,5 +23,6 @@ class AudioSession:
     chunks: list[bytes] = field(default_factory=list)
     prefill_queue: asyncio.Queue[tuple[int, bytes]] = field(default_factory=asyncio.Queue)
     prefill_task: Optional[asyncio.Task] = None
+    vad: Any = None
     started_at: float = field(default_factory=time.time)
     stopped: bool = False

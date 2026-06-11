@@ -10,6 +10,14 @@ export class RealtimeAudioClient extends EventTarget {
       getPrefillMs: () => 600,
       getSkillNames: () => [],
       getOutputAudio: () => false,
+      getVadConfig: () => null,
+      useWebAudioPlayback: false,
+      autoVad: false,
+      vadFrameMs: 50,
+      vadThreshold: 0.018,
+      vadMinSpeechMs: 180,
+      vadMinSilenceMs: 850,
+      vadMaxSpeechMs: 18000,
       ...options,
     };
     this.state = {
@@ -31,14 +39,31 @@ export class RealtimeAudioClient extends EventTarget {
       playedAssistantText: "",
       finalReceived: false,
       finalText: "",
+      finalHistoryText: "",
       historySavedForTurn: false,
       interrupted: false,
       streamedAudioCount: 0,
       streamingTextStarted: false,
       mode: "idle",
       timer: null,
+      flushResolve: null,
+      playbackContext: null,
+      playbackGeneration: 0,
+      vad: this.createVadState(),
     };
     this.setMode("idle");
+  }
+
+  createVadState() {
+    return {
+      enabled: Boolean(this.options.autoVad),
+      speechStarted: false,
+      autoStopping: false,
+      speechMs: 0,
+      silenceMs: 0,
+      totalSpeechMs: 0,
+      latestRms: 0,
+    };
   }
 
   on(type, listener) {
@@ -114,8 +139,10 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.playedAssistantText = "";
     this.state.finalReceived = false;
     this.state.finalText = "";
+    this.state.finalHistoryText = "";
     this.state.historySavedForTurn = false;
     this.state.interrupted = false;
+    this.state.vad = this.createVadState();
     this.emitMetrics();
 
     const socket = new WebSocket(this.options.getWebSocketUrl());
@@ -142,13 +169,22 @@ export class RealtimeAudioClient extends EventTarget {
     await this.state.audioContext.audioWorklet.addModule(this.options.recorderWorkletUrl);
     this.state.source = this.state.audioContext.createMediaStreamSource(this.state.stream);
     this.state.node = new AudioWorkletNode(this.state.audioContext, "pcm-chunker", {
-      processorOptions: { chunkMs },
+      processorOptions: { chunkMs, vadFrameMs: this.options.vadFrameMs },
     });
     this.state.sink = this.state.audioContext.createGain();
     this.state.sink.gain.value = 0;
 
     this.state.node.port.onmessage = (event) => {
-      if (!event.data || event.data.type !== "chunk") return;
+      if (!event.data) return;
+      if (event.data.type === "level") {
+        this.handleVadLevel(event.data);
+        return;
+      }
+      if (event.data.type === "flushed") {
+        this.resolveFlush();
+        return;
+      }
+      if (event.data.type !== "chunk") return;
       if (!this.state.ws || this.state.ws !== socket || this.state.ws.readyState !== WebSocket.OPEN) return;
       socket.send(event.data.pcm);
       this.state.chunks += 1;
@@ -168,6 +204,7 @@ export class RealtimeAudioClient extends EventTarget {
         prompt: this.options.getPrompt().trim(),
         skillNames: this.options.getSkillNames(),
         outputAudio: Boolean(this.options.getOutputAudio()),
+        vad: this.options.getVadConfig(),
         history: this.state.history,
       }),
     );
@@ -177,16 +214,117 @@ export class RealtimeAudioClient extends EventTarget {
     this.setStatus("录音中", true);
     this.setMode("recording");
     this.log(`mic sampleRate=${this.state.audioContext.sampleRate}, chunkMs=${chunkMs}`);
+    if (this.options.autoVad) {
+      this.setVoiceState("等待说话");
+      this.emit("vad", { event: "waiting", speaking: false, rms: 0 });
+    }
+  }
+
+  async unlockAudioOutput() {
+    if (!this.options.useWebAudioPlayback) return;
+    const context = this.ensurePlaybackContext();
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+    const source = context.createBufferSource();
+    source.buffer = context.createBuffer(1, 1, context.sampleRate);
+    source.connect(context.destination);
+    source.start();
+  }
+
+  ensurePlaybackContext() {
+    if (!this.state.playbackContext) {
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor) throw new Error("WebAudio is not supported by this browser");
+      this.state.playbackContext = new AudioContextCtor();
+    }
+    return this.state.playbackContext;
   }
 
   async stopRecording() {
+    if (this.state.mode !== "recording") return;
     this.setMode("finalizing");
     this.setStatus("停止录音，等待最终推理");
     this.setVoiceState("模型输出中");
+    await this.flushInput();
     this.stopInputDevices();
     if (this.state.ws && this.state.ws.readyState === WebSocket.OPEN) {
       this.state.ws.send(JSON.stringify({ type: "stop" }));
     }
+  }
+
+  async flushInput() {
+    if (!this.state.node) return;
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.state.flushResolve === done) {
+          this.state.flushResolve = null;
+        }
+        resolve();
+      }, 250);
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.state.flushResolve = done;
+      this.state.node.port.postMessage({ type: "flush" });
+    });
+  }
+
+  resolveFlush() {
+    if (!this.state.flushResolve) return;
+    const resolve = this.state.flushResolve;
+    this.state.flushResolve = null;
+    resolve();
+  }
+
+  handleVadLevel(data) {
+    const vad = this.state.vad;
+    if (!vad.enabled || this.state.mode !== "recording" || vad.autoStopping) return;
+
+    const durationMs = Number(data.durationMs || this.options.vadFrameMs || 50);
+    const rms = Number(data.rms || 0);
+    const speaking = rms >= Number(this.options.vadThreshold || 0.018);
+    vad.latestRms = rms;
+
+    if (speaking) {
+      vad.speechMs += durationMs;
+      vad.totalSpeechMs += durationMs;
+      vad.silenceMs = 0;
+      if (!vad.speechStarted && vad.speechMs >= Number(this.options.vadMinSpeechMs || 180)) {
+        vad.speechStarted = true;
+        this.setVoiceState("正在听你说");
+        this.emit("vad", { event: "speech_start", speaking: true, rms });
+      }
+      if (vad.speechStarted && vad.totalSpeechMs >= Number(this.options.vadMaxSpeechMs || 18000)) {
+        this.autoStopByVad("max_speech");
+      }
+      return;
+    }
+
+    vad.speechMs = 0;
+    if (!vad.speechStarted) {
+      this.emit("vad", { event: "silence", speaking: false, rms });
+      return;
+    }
+
+    vad.silenceMs += durationMs;
+    this.emit("vad", { event: "speech_silence", speaking: false, rms, silenceMs: vad.silenceMs });
+    if (vad.silenceMs >= Number(this.options.vadMinSilenceMs || 850)) {
+      this.autoStopByVad("speech_end");
+    }
+  }
+
+  autoStopByVad(reason) {
+    const vad = this.state.vad;
+    if (vad.autoStopping || this.state.mode !== "recording") return;
+    vad.autoStopping = true;
+    this.setVoiceState("检测到说完，正在推理");
+    this.emit("vad", { event: reason, speaking: false, rms: vad.latestRms });
+    this.stopRecording().catch((err) => {
+      this.log(`vad stop error: ${err.message || err}`, "error");
+      this.setMode("idle");
+    });
   }
 
   stopInputDevices() {
@@ -233,6 +371,30 @@ export class RealtimeAudioClient extends EventTarget {
       case "prefill_error":
         this.log(`prefill ${data.chunk_index || ""} error: ${data.message || data.status_code}`, "error");
         break;
+      case "vad_ready":
+        this.setVoiceState("等待说话");
+        this.emit("vad", { event: "ready", engine: data.engine, threshold: data.threshold });
+        this.log(
+          `vad ready engine=${data.engine} threshold=${data.threshold} silence=${data.min_silence_ms}ms`,
+        );
+        break;
+      case "vad_speech_start":
+        this.setVoiceState("正在听你说");
+        this.emit("vad", { event: "speech_start", speaking: true, probability: data.probability });
+        break;
+      case "vad_speech_end":
+        this.setVoiceState("检测到说完，正在推理");
+        this.emit("vad", { event: data.event || "speech_end", speaking: false, probability: data.probability });
+        this.stopRecording().catch((err) => {
+          this.log(`server vad stop error: ${err.message || err}`, "error");
+          this.setMode("idle");
+        });
+        break;
+      case "vad_error":
+        this.log(`vad error: ${data.message}`, "error");
+        this.setVoiceState("VAD 不可用");
+        this.emit("vad", { event: "error", message: data.message });
+        break;
       case "finalizing":
         this.log(`finalizing ${data.chunks} chunks`);
         this.emit("result", { text: "模型输出中。", replace: true });
@@ -250,6 +412,12 @@ export class RealtimeAudioClient extends EventTarget {
         this.enqueueAudio(data.audio_data_url, data.audio_index || this.state.streamedAudioCount);
         this.setVoiceState("正在播报中");
         this.log(`audio chunk ${data.audio_index || this.state.streamedAudioCount} received`);
+        break;
+      case "component_call_started":
+        this.stopPlayback();
+        this.emit("result", { text: "正在查询开户网点...", replace: true, loading: true });
+        this.setVoiceState("正在查询开户网点");
+        this.log(`component call ${data.components || ""} started`);
         break;
       case "final_result":
         this.handleFinalResult(data, socket);
@@ -273,26 +441,31 @@ export class RealtimeAudioClient extends EventTarget {
     const currentText = this.getDisplayedText();
     if (data.text) {
       this.state.finalText = data.text;
+      this.state.finalHistoryText = typeof data.history_text === "string" ? data.history_text : data.text;
       this.emit("result", { text: data.text, replace: true });
     } else if (!this.state.streamingTextStarted) {
       this.emit("result", { text: "服务端没有返回文本。", replace: true });
       this.state.finalText = "";
+      this.state.finalHistoryText = "";
     } else {
       this.state.finalText = currentText;
+      this.state.finalHistoryText = typeof data.history_text === "string" ? data.history_text : currentText;
     }
 
     if (data.audio_data_url) {
-      this.enqueueAudio(data.audio_data_url, this.state.streamedAudioCount + 1);
+      this.enqueueAudio(data.audio_data_url, this.state.streamedAudioCount + 1, this.state.finalHistoryText);
     } else if (this.state.streamedAudioCount === 0) {
       this.setVoiceState("播报完");
-      this.saveCurrentTurnHistory(this.state.finalText || this.getDisplayedText());
+      this.saveCurrentTurnHistory(this.state.finalHistoryText || this.state.finalText || this.getDisplayedText());
       this.log("没有解析到音频输出。确认模型服务启用了音频输出和 stream。");
     }
 
     if (this.hasPendingPlayback()) {
       this.setMode("speaking");
     } else {
-      this.saveCurrentTurnHistory(this.state.finalText || this.state.playedAssistantText || this.getDisplayedText());
+      this.saveCurrentTurnHistory(
+        this.state.finalHistoryText || this.state.finalText || this.state.playedAssistantText || this.getDisplayedText(),
+      );
       this.setMode("idle");
     }
     this.log(
@@ -341,20 +514,29 @@ export class RealtimeAudioClient extends EventTarget {
   }
 
   stopPlayback() {
+    this.state.playbackGeneration += 1;
     if (this.state.currentAudio) {
       this.state.currentAudio.onended = null;
       this.state.currentAudio.onerror = null;
-      this.state.currentAudio.pause();
+      if (typeof this.state.currentAudio.pause === "function") {
+        this.state.currentAudio.pause();
+      } else if (typeof this.state.currentAudio.stop === "function") {
+        try {
+          this.state.currentAudio.stop();
+        } catch (_err) {
+          // Already stopped.
+        }
+      }
       this.state.currentAudio = null;
     }
     this.state.audioQueue = [];
     this.state.audioPlaying = false;
   }
 
-  enqueueAudio(audioDataUrl, audioIndex) {
+  enqueueAudio(audioDataUrl, audioIndex, historyText = "") {
     if (!audioDataUrl) return;
     const index = Number(audioIndex || this.state.streamedAudioCount || 1);
-    this.state.audioTextByIndex.set(index, this.getDisplayedText());
+    this.state.audioTextByIndex.set(index, historyText || this.getDisplayedText());
     this.state.audioQueue.push({ url: audioDataUrl, index });
     if (!this.state.audioPlaying) {
       this.playNextAudio();
@@ -378,6 +560,45 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.audioPlaying = true;
     this.setVoiceState("正在播报中");
 
+    if (this.options.useWebAudioPlayback) {
+      const generation = this.state.playbackGeneration;
+      this.playNextAudioWithWebAudio(next, generation).catch((err) => {
+        this.log(`web audio play error: ${err.message || err}`, "error");
+        if (generation === this.state.playbackGeneration) {
+          this.playNextAudioWithElement(next);
+        }
+      });
+      return;
+    }
+
+    this.playNextAudioWithElement(next);
+  }
+
+  async playNextAudioWithWebAudio(next, generation) {
+    const context = this.ensurePlaybackContext();
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+    const arrayBuffer = await this.audioDataUrlToArrayBuffer(next.url);
+    const audioBuffer = await context.decodeAudioData(arrayBuffer);
+    if (generation !== this.state.playbackGeneration || !this.state.audioPlaying) return;
+
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(context.destination);
+    this.state.currentAudio = source;
+    source.onended = () => {
+      if (this.state.currentAudio === source) {
+        this.state.currentAudio = null;
+      }
+      this.state.playedAssistantText =
+        this.state.audioTextByIndex.get(next.index) || this.state.playedAssistantText || this.getDisplayedText();
+      this.playNextAudio();
+    };
+    source.start();
+  }
+
+  playNextAudioWithElement(next) {
     const player = new Audio(next.url);
     this.state.currentAudio = player;
     player.onended = () => {
@@ -402,6 +623,26 @@ export class RealtimeAudioClient extends EventTarget {
       }
       setTimeout(() => this.playNextAudio(), 0);
     });
+  }
+
+  async audioDataUrlToArrayBuffer(dataUrl) {
+    const commaIndex = dataUrl.indexOf(",");
+    if (dataUrl.startsWith("data:") && commaIndex >= 0) {
+      const header = dataUrl.slice(0, commaIndex);
+      const body = dataUrl.slice(commaIndex + 1);
+      if (header.includes(";base64")) {
+        const binary = atob(body);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes.buffer;
+      }
+      return new TextEncoder().encode(decodeURIComponent(body)).buffer;
+    }
+    const response = await fetch(dataUrl);
+    if (!response.ok) throw new Error(`audio fetch failed: ${response.status}`);
+    return response.arrayBuffer();
   }
 
   rememberTurn(assistantText) {

@@ -281,15 +281,15 @@
 
       <footer class="controls">
         <div class="action-wrap">
-          <button id="actionBtn" class="action-button" aria-label="开始录音">
-            开始录音
+          <button id="actionBtn" class="action-button" aria-label="开始对话">
+            开始对话
           </button>
         </div>
       </footer>
     </main>
 
     <script type="module">
-      import { RealtimeAudioClient } from "/static/realtime-audio-client.js";
+      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=demo-silero-vad-audio-20260611";
 
       const els = {
         actionBtn: document.getElementById("actionBtn"),
@@ -300,35 +300,51 @@
       };
 
       let model = "";
-      const prompt =
+      let prompt =
         "你正在进行实时语音对话。请不要转写、复述或翻译用户的语音内容。请先理解用户语音里的意图，然后像聊天助手一样直接回答用户的问题。请根据问题复杂度给出完整、有帮助的回答；只有在用户只是打招呼时才简短回应。";
+      let autoConversation = false;
+      let restartTimer = null;
 
       const client = new RealtimeAudioClient({
+        recorderWorkletUrl: "/static/recorder-worklet.js?v=demo-silero-vad-audio-20260611",
+        useWebAudioPlayback: true,
         getModel: () => model,
         getPrompt: () => prompt,
         getPrefillMs: () => 600,
         getDisplayedText: () => els.resultText.textContent,
+        getOutputAudio: () => true,
+        getVadConfig: () => ({
+          engine: "silero",
+          threshold: 0.5,
+          minSpeechMs: 180,
+          minSilenceMs: 850,
+          maxSpeechMs: 18000,
+          speechPadMs: 30,
+        }),
       });
 
       function renderMode(mode) {
         els.actionBtn.disabled = mode === "busy";
         els.actionBtn.className = `action-button ${mode}`;
-        const interrupting = mode === "finalizing" || mode === "speaking";
-        els.actionBtn.setAttribute("aria-label", interrupting ? "打断" : mode === "recording" ? "停止并推理" : "开始录音");
+        els.actionBtn.setAttribute("aria-label", autoConversation ? "结束对话" : "开始对话");
         if (mode === "idle") {
-          els.actionBtn.textContent = "开始录音";
+          els.actionBtn.textContent = autoConversation ? "结束对话" : "开始对话";
           setOrbMode("");
         } else if (mode === "recording") {
-          els.actionBtn.textContent = "停止并推理";
+          els.actionBtn.textContent = "结束对话";
           setOrbMode("listening");
         } else if (mode === "finalizing") {
-          els.actionBtn.textContent = "打断";
+          els.actionBtn.textContent = "结束对话";
           setOrbMode("thinking");
         } else if (mode === "speaking") {
-          els.actionBtn.textContent = "打断";
+          els.actionBtn.textContent = "结束对话";
           setOrbMode("speaking");
         } else {
           els.actionBtn.textContent = "处理中";
+        }
+
+        if (mode === "idle" && autoConversation) {
+          scheduleRestart();
         }
       }
 
@@ -338,8 +354,14 @@
 
       client.on("config", ({ config }) => {
         model = config.model || "";
+        prompt = config.default_prompt || prompt;
       });
       client.on("mode", ({ mode }) => renderMode(mode));
+      client.on("vad", ({ event }) => {
+        if (event === "speech_start") {
+          els.hint.hidden = true;
+        }
+      });
       client.on("voiceState", ({ text }) => {
         els.voiceState.textContent = text;
       });
@@ -350,6 +372,10 @@
       client.on("clearLog", () => {});
       client.on("metrics", () => {});
       client.on("result", ({ text, append, replace }) => {
+        if (replace && text === "录音中。") {
+          els.resultText.textContent = "";
+          return;
+        }
         els.hint.hidden = true;
         if (append) {
           els.resultText.textContent += text || "";
@@ -359,12 +385,59 @@
       });
 
       els.actionBtn.addEventListener("click", () => {
-        client.handleAction().catch((err) => {
-          client.setMode("idle");
-          client.setVoiceState("倾听中");
-          console.error(err);
-        });
+        if (autoConversation) {
+          stopConversation();
+        } else {
+          startConversation();
+        }
       });
+
+      function startConversation() {
+        autoConversation = true;
+        els.hint.hidden = false;
+        els.resultText.textContent = "";
+        Promise.resolve()
+          .then(() => client.unlockAudioOutput())
+          .then(() => client.startRecording())
+          .catch((err) => {
+            autoConversation = false;
+            client.setMode("idle");
+            client.setVoiceState("倾听中");
+            console.error(err);
+          });
+        renderMode(client.state.mode);
+      }
+
+      function stopConversation() {
+        autoConversation = false;
+        clearRestartTimer();
+        client.stopPlayback();
+        client.stopInputDevices();
+        client.closeWs();
+        client.setMode("idle");
+        client.setVoiceState("倾听中");
+        renderMode("idle");
+      }
+
+      function scheduleRestart() {
+        if (restartTimer || client.state.mode !== "idle") return;
+        restartTimer = setTimeout(() => {
+          restartTimer = null;
+          if (!autoConversation || client.state.mode !== "idle") return;
+          client.startRecording().catch((err) => {
+            autoConversation = false;
+            client.setMode("idle");
+            client.setVoiceState("倾听中");
+            console.error(err);
+          });
+        }, 550);
+      }
+
+      function clearRestartTimer() {
+        if (!restartTimer) return;
+        clearTimeout(restartTimer);
+        restartTimer = null;
+      }
 
       renderMode("idle");
       client.loadServerConfig().catch((err) => console.error(err));
