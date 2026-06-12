@@ -156,9 +156,3 @@ def fold_block_scalar(lines: list[str], *, literal: bool) -> str:
 def normalize_skill_name(value: str) -> str:
     cleaned = SAFE_NAME_RE.sub("-", value.strip()).strip("-._")
     return cleaned.lower()
-
-
-def format_skill_for_prompt(skill: RuntimeSkill) -> str:
-    header = f"<runtime_skill name=\"{skill.name}\">"
-    description = f"description: {skill.description}\n" if skill.description else ""
-    return f"{header}\n{description}{skill.content}\n</runtime_skill>"

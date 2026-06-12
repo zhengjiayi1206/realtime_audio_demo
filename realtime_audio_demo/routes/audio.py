@@ -20,6 +20,7 @@ from realtime_audio_demo.config import (
     normalize_model_name,
 )
 from realtime_audio_demo.events import send_event
+from realtime_audio_demo.routes.request_utils import read_json_object
 from realtime_audio_demo.services.component_tools import (
     call_component_tool,
     extract_component_call,
@@ -58,13 +59,9 @@ SPEECH_PROMPT = (
 @router.post("/api/realtime/text")
 @router.post("/api/chatbox/text")
 async def chatbox_text(request: Request) -> JSONResponse:
-    try:
-        payload = await request.json()
-    except json.JSONDecodeError as exc:
-        return JSONResponse({"message": f"bad json: {exc}"}, status_code=400)
-
-    if not isinstance(payload, dict):
-        return JSONResponse({"message": "json body must be an object"}, status_code=400)
+    payload, error_response = await read_json_object(request)
+    if error_response is not None:
+        return error_response
 
     user_text = str(payload.get("text") or "").strip()
     if not user_text:
@@ -86,19 +83,9 @@ async def chatbox_text(request: Request) -> JSONResponse:
     if status_code >= 400:
         return JSONResponse(result, status_code=status_code)
 
-    intent_json = extract_json_object(result.get("text"))
-    json_repair: dict[str, Any] | None = None
-    if intent_json is None:
-        intent_json, json_repair = await repair_intent_json(model, result.get("text"))
-        if intent_json is not None:
-            result["text"] = json.dumps(intent_json, ensure_ascii=False, indent=2)
+    result["text"], intent_json, json_repair = await parse_chatbox_intent_json(model, result.get("text"))
     intent_target = complete_intent_target(intent_json)
-    logger.info(
-        "chatbox intent route text intent=%s target=%s repaired=%s",
-        json.dumps(intent_json, ensure_ascii=False) if intent_json is not None else None,
-        json.dumps(intent_target, ensure_ascii=False) if intent_target is not None else None,
-        bool(json_repair),
-    )
+    log_chatbox_intent_route("text", intent_json, intent_target, json_repair)
     selected_skill: str | None = None
     skill_selection: dict[str, Any] | None = None
     new_session = False
@@ -148,13 +135,9 @@ async def chatbox_text(request: Request) -> JSONResponse:
 
 @router.post("/api/chatbox/speech")
 async def chatbox_speech(request: Request) -> JSONResponse:
-    try:
-        payload = await request.json()
-    except json.JSONDecodeError as exc:
-        return JSONResponse({"message": f"bad json: {exc}"}, status_code=400)
-
-    if not isinstance(payload, dict):
-        return JSONResponse({"message": "json body must be an object"}, status_code=400)
+    payload, error_response = await read_json_object(request)
+    if error_response is not None:
+        return error_response
 
     text = str(payload.get("text") or "").strip()
     if not text:
@@ -171,37 +154,19 @@ async def maybe_route_chatbox_voice_intent(
     assistant_text: str | None,
     skill_names: list[str],
 ) -> tuple[str | None, str, dict[str, Any]]:
-    meta: dict[str, Any] = {
-        "intent_target": None,
-        "json_repair": None,
-        "selected_skill": None,
-        "selected_skills": [],
-        "skill_selection": None,
-        "new_session": False,
-        "skills": [],
-        "missing_skills": [],
-    }
+    meta = default_chatbox_routing_meta()
     user_history_text = "[用户通过语音输入了一条消息]"
     if not assistant_text:
         return assistant_text, user_history_text, meta
 
-    intent_json = extract_json_object(assistant_text)
-    if intent_json is None:
-        intent_json, meta["json_repair"] = await repair_intent_json(model, assistant_text)
-        if intent_json is not None:
-            assistant_text = json.dumps(intent_json, ensure_ascii=False, indent=2)
+    assistant_text, intent_json, meta["json_repair"] = await parse_chatbox_intent_json(model, assistant_text)
 
     if intent_json:
         user_history_text = format_voice_user_history(intent_json)
 
     intent_target = complete_intent_target(intent_json)
     meta["intent_target"] = intent_target
-    logger.info(
-        "chatbox intent route voice intent=%s target=%s repaired=%s",
-        json.dumps(intent_json, ensure_ascii=False) if intent_json is not None else None,
-        json.dumps(intent_target, ensure_ascii=False) if intent_target is not None else None,
-        bool(meta["json_repair"]),
-    )
+    log_chatbox_intent_route("voice", intent_json, intent_target, meta["json_repair"])
     if not intent_json or not intent_target:
         return assistant_text, user_history_text, meta
 
@@ -236,6 +201,47 @@ async def maybe_route_chatbox_voice_intent(
     return assistant_text, user_history_text, meta
 
 
+def default_chatbox_routing_meta() -> dict[str, Any]:
+    return {
+        "intent_target": None,
+        "json_repair": None,
+        "selected_skill": None,
+        "selected_skills": [],
+        "skill_selection": None,
+        "new_session": False,
+        "skills": [],
+        "missing_skills": [],
+    }
+
+
+async def parse_chatbox_intent_json(
+    model: str,
+    assistant_text: str | None,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    intent_json = extract_json_object(assistant_text)
+    json_repair: dict[str, Any] | None = None
+    if intent_json is None:
+        intent_json, json_repair = await repair_intent_json(model, assistant_text)
+        if intent_json is not None:
+            assistant_text = json.dumps(intent_json, ensure_ascii=False, indent=2)
+    return assistant_text, intent_json, json_repair
+
+
+def log_chatbox_intent_route(
+    route: str,
+    intent_json: dict[str, Any] | None,
+    intent_target: dict[str, Any] | None,
+    json_repair: dict[str, Any] | None,
+) -> None:
+    logger.info(
+        "chatbox intent route %s intent=%s target=%s repaired=%s",
+        route,
+        json.dumps(intent_json, ensure_ascii=False) if intent_json is not None else None,
+        json.dumps(intent_target, ensure_ascii=False) if intent_target is not None else None,
+        bool(json_repair),
+    )
+
+
 def format_voice_user_history(intent_json: dict[str, Any]) -> str:
     content = str(intent_json.get("content") or "").strip()
     intention = str(intent_json.get("intention") or "").strip()
@@ -258,13 +264,9 @@ def format_voice_user_history(intent_json: dict[str, Any]) -> str:
 
 @router.post("/api/chatbox/components/call")
 async def chatbox_component_call(request: Request) -> JSONResponse:
-    try:
-        payload = await request.json()
-    except json.JSONDecodeError as exc:
-        return JSONResponse({"message": f"bad json: {exc}"}, status_code=400)
-
-    if not isinstance(payload, dict):
-        return JSONResponse({"message": "json body must be an object"}, status_code=400)
+    payload, error_response = await read_json_object(request)
+    if error_response is not None:
+        return error_response
 
     component = str(payload.get("components") or "").strip()
     params = payload.get("params") or {}
@@ -414,10 +416,6 @@ def normalize_skill_names(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
-
-
-def output_modalities(output_audio: bool) -> list[str]:
-    return ["text", "audio"] if output_audio else ["text"]
 
 
 async def synthesize_speech_audio(model: str, text: str | None) -> str | None:
@@ -792,20 +790,18 @@ async def finalize_session(session: AudioSession) -> None:
     await send_event(
         session,
         "final_result",
-        {
-            "text": text,
-            "audio_data_url": audio_data_url,
-            "history_text": normalized.history_text,
-            "speech_text": normalized.speech_text,
-            "user_history_text": user_history_text,
-            "output_is_json": normalized.is_json,
-            "component_call": component_call,
-            "component_result": component_result,
-            **routing_meta,
-            "raw_response": data,
-            "saved_input_wav": str(input_path),
-            "latency_ms": latency_ms,
-        },
+        build_final_result_payload(
+            text=text,
+            audio_data_url=audio_data_url,
+            normalized=normalized,
+            user_history_text=user_history_text,
+            component_call=component_call,
+            component_result=component_result,
+            routing_meta=routing_meta,
+            raw_response=data,
+            input_path=input_path,
+            latency_ms=latency_ms,
+        ),
     )
 
 
@@ -949,10 +945,44 @@ async def stream_final_session(
     await send_event(
         session,
         "final_result",
+        build_final_result_payload(
+            text=text,
+            audio_data_url=audio_data_url,
+            normalized=normalized,
+            user_history_text=user_history_text,
+            component_call=component_call,
+            component_result=component_result,
+            routing_meta=routing_meta,
+            raw_response=None,
+            input_path=input_path,
+            latency_ms=int((time.perf_counter() - start) * 1000),
+            audio_chunks=audio_count,
+        ),
+    )
+
+
+def build_final_result_payload(
+    *,
+    text: str | None,
+    audio_data_url: str | None,
+    normalized: Any,
+    user_history_text: str,
+    component_call: dict[str, Any] | None,
+    component_result: dict[str, Any] | None,
+    routing_meta: dict[str, Any],
+    raw_response: dict[str, Any] | None,
+    input_path: Path,
+    latency_ms: int,
+    audio_chunks: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "text": text,
+        "audio_data_url": audio_data_url,
+    }
+    if audio_chunks is not None:
+        payload["audio_chunks"] = audio_chunks
+    payload.update(
         {
-            "text": text,
-            "audio_data_url": audio_data_url,
-            "audio_chunks": audio_count,
             "history_text": normalized.history_text,
             "speech_text": normalized.speech_text,
             "user_history_text": user_history_text,
@@ -960,8 +990,9 @@ async def stream_final_session(
             "component_call": component_call,
             "component_result": component_result,
             **routing_meta,
-            "raw_response": None,
+            "raw_response": raw_response,
             "saved_input_wav": str(input_path),
-            "latency_ms": int((time.perf_counter() - start) * 1000),
-        },
+            "latency_ms": latency_ms,
+        }
     )
+    return payload

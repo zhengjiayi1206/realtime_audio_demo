@@ -36,13 +36,6 @@ def extract_component_call(text: str | None) -> dict[str, Any] | None:
     }
 
 
-def is_component_call(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    component = value.get("components")
-    return isinstance(component, str) and component.strip() == BRANCH_LOOKUP_COMPONENT
-
-
 async def call_component_tool(component: str, params: dict[str, Any]) -> tuple[dict[str, Any], int]:
     component = component.strip()
     if component != BRANCH_LOOKUP_COMPONENT:
