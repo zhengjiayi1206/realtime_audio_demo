@@ -23,4 +23,4 @@ export REALTIME_DEFAULT_SKILLS="${REALTIME_DEFAULT_SKILLS:-}"
 export REALTIME_SKILL_MAX_CHARS="${REALTIME_SKILL_MAX_CHARS:-12000}"
 
 cd "${SCRIPT_DIR}"
-exec "${VENV_PY}" -m uvicorn app:app --host "${HOST:-0.0.0.0}" --port "${PORT:-55785}"
+exec "${VENV_PY}" -m uvicorn app:app --host "${HOST:-0.0.0.0}" --port "${PORT:-55785}" --log-level info

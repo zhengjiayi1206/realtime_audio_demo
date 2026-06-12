@@ -39,7 +39,7 @@ if [[ -f "${PID_FILE}" ]]; then
   fi
 fi
 
-nohup "${VENV_PY}" -m uvicorn app:app --host "${HOST}" --port "${PORT}" > "${LOG_FILE}" 2>&1 &
+nohup "${VENV_PY}" -m uvicorn app:app --host "${HOST}" --port "${PORT}" --log-level info > "${LOG_FILE}" 2>&1 &
 pid="$!"
 echo "${pid}" > "${PID_FILE}"
 

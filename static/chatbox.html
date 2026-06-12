@@ -269,9 +269,9 @@
         border-left: 1px solid var(--line);
         background: rgba(255, 255, 255, 0.86);
         display: grid;
-        grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
-        gap: 20px;
-        padding: 22px 20px;
+        grid-template-rows: auto auto auto minmax(360px, 1fr) auto;
+        gap: 14px;
+        padding: 16px 20px 18px;
         overflow: auto;
       }
 
@@ -290,19 +290,19 @@
         display: grid;
         justify-items: center;
         text-align: center;
-        gap: 7px;
+        gap: 5px;
       }
 
       .agent-icon {
-        width: 70px;
-        height: 70px;
+        width: 56px;
+        height: 56px;
         display: grid;
         place-items: center;
-        border-radius: 18px;
+        border-radius: 14px;
         background: linear-gradient(145deg, #d77966, #c64f3a);
         color: #fff;
-        box-shadow: 0 18px 34px rgba(173, 68, 48, 0.24);
-        font-size: 32px;
+        box-shadow: 0 12px 24px rgba(173, 68, 48, 0.2);
+        font-size: 26px;
       }
 
       .agent-summary h1 {
@@ -444,8 +444,9 @@
 
       .skill-list {
         display: grid;
+        align-content: start;
         gap: 8px;
-        max-height: 260px;
+        min-height: 0;
         overflow: auto;
         border: 1px solid var(--line);
         border-radius: 8px;
@@ -492,6 +493,30 @@
         color: var(--muted);
         line-height: 1.35;
         overflow-wrap: anywhere;
+      }
+
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 28px;
+        z-index: 20;
+        transform: translate(-50%, 12px);
+        opacity: 0;
+        pointer-events: none;
+        border: 1px solid rgba(16, 24, 40, 0.08);
+        border-radius: 8px;
+        padding: 10px 14px;
+        background: rgba(16, 24, 40, 0.92);
+        color: #fff;
+        box-shadow: 0 12px 28px rgba(16, 24, 40, 0.22);
+        font-size: 13px;
+        line-height: 1.4;
+        transition: opacity 160ms ease, transform 160ms ease;
+      }
+
+      .toast.show {
+        opacity: 1;
+        transform: translate(-50%, 0);
       }
 
       .side-actions {
@@ -596,11 +621,6 @@
         </section>
 
         <section class="option-panel">
-          <h2>System</h2>
-          <textarea id="systemPromptInput" class="system-textarea" rows="5" placeholder="输入 system prompt..."></textarea>
-        </section>
-
-        <section class="option-panel">
           <h2>输出设置</h2>
           <label class="switch-row" for="outputVoiceSwitch">
             <span class="switch-copy">
@@ -627,9 +647,10 @@
         </section>
       </aside>
     </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script type="module">
-      import { RealtimeAudioClient } from "/static/realtime-audio-client.js";
+      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=voice-history-20260612";
 
       const els = {
         conversation: document.getElementById("conversation"),
@@ -647,11 +668,10 @@
         deleteChatBtn: document.getElementById("deleteChatBtn"),
         closePanelBtn: document.getElementById("closePanelBtn"),
         outputVoiceSwitch: document.getElementById("outputVoiceSwitch"),
-        systemPromptInput: document.getElementById("systemPromptInput"),
+        toast: document.getElementById("toast"),
       };
 
       let modelName = "";
-      let realtimePrompt = "";
       let currentMode = "idle";
       let assistantBubble = null;
       let textBusy = false;
@@ -659,28 +679,34 @@
       let autoConversation = false;
       let restartTimer = null;
       let startInFlight = false;
+      let toastTimer = null;
 
       const client = new RealtimeAudioClient({
         useWebAudioPlayback: true,
-        enableBargeIn: true,
+        enableBargeIn: false,
         bargeInAfterFinalResultOnly: true,
         bargeInChunkMs: 120,
         bargeInCooldownMs: 900,
         getModel: () => modelName,
-        getPrompt: () => realtimePrompt,
+        getPrompt: () => "",
+        getRouteContext: () => "chatbox",
         getPrefillMs: () => 600,
         getDisplayedText: () => assistantBubble?.textContent || "",
         getSkillNames: selectedSkills,
         getOutputAudio: outputAudioEnabled,
         getStreamSpeechAudio: outputAudioEnabled,
-        getVadConfig: () => ({
-          engine: "silero",
-          threshold: 0.5,
-          minSpeechMs: 180,
-          minSilenceMs: 450,
-          maxSpeechMs: 30000,
-          speechPadMs: 30,
-        }),
+        shouldAutoStopOnVad: () => autoConversation,
+        getVadConfig: () =>
+          autoConversation
+            ? {
+                engine: "silero",
+                threshold: 0.5,
+                minSpeechMs: 180,
+                minSilenceMs: 450,
+                maxSpeechMs: 30000,
+                speechPadMs: 30,
+              }
+            : null,
         getBargeInVadConfig: () => ({
           engine: "silero",
           threshold: 0.92,
@@ -693,8 +719,6 @@
 
       client.on("config", ({ config }) => {
         modelName = config.model || "";
-        realtimePrompt = config.default_prompt || "";
-        els.systemPromptInput.value = realtimePrompt;
         client.state.maxHistoryTurns = Number(config.max_history_turns || 10);
       });
 
@@ -756,6 +780,22 @@
         setStatus("检测到插话，开始录音", true);
       });
 
+      client.on("userTranscript", ({ text }) => {
+        const lastUser = lastBubble("user");
+        if (lastUser && (lastUser.textContent === "语音输入中..." || lastUser.textContent === "语音输入已提交")) {
+          lastUser.textContent = text || lastUser.textContent;
+        }
+      });
+
+      client.on("routedSession", ({ selected_skills, user_text }) => {
+        applySelectedSkills(selected_skills || [], { replace: true });
+        showToast(`意图识别成功，已切换到 ${formatSkillNames(selected_skills)}`);
+        client.state.history = [];
+        if (user_text) {
+          resetConversationForRoutedSession(user_text);
+        }
+      });
+
       els.liveCallBtn.addEventListener("click", async () => {
         els.liveCallBtn.disabled = true;
         try {
@@ -783,7 +823,11 @@
             return;
           }
           stopTextAudio();
-          await client.handleAction();
+          if (client.state.mode === "idle") {
+            await client.startRecording();
+          } else if (client.state.mode === "recording") {
+            await client.stopRecording();
+          }
         } catch (err) {
           setStatus(err.message || String(err), false);
           client.setMode("idle");
@@ -805,9 +849,6 @@
       els.newChatBtn.addEventListener("click", clearConversation);
       els.deleteChatBtn.addEventListener("click", clearConversation);
       els.closePanelBtn.addEventListener("click", () => document.body.classList.toggle("panel-hidden"));
-      els.systemPromptInput.addEventListener("input", () => {
-        realtimePrompt = els.systemPromptInput.value;
-      });
       els.outputVoiceSwitch.addEventListener("change", () => {
         if (!outputAudioEnabled()) {
           stopTextAudio();
@@ -817,6 +858,34 @@
 
       function selectedSkills() {
         return [...els.skills.querySelectorAll("input[type='checkbox']:checked")].map((node) => node.value);
+      }
+
+      function applySelectedSkills(skillNames, options = {}) {
+        if (!Array.isArray(skillNames) || !skillNames.length) return;
+        const selected = new Set(skillNames.map((name) => String(name || "").toLowerCase()));
+        for (const checkbox of els.skills.querySelectorAll("input[type='checkbox']")) {
+          const matched = selected.has(String(checkbox.value || "").toLowerCase());
+          if (options.replace) {
+            checkbox.checked = matched;
+          } else if (matched) {
+            checkbox.checked = true;
+          }
+        }
+      }
+
+      function showToast(text) {
+        if (!els.toast) return;
+        clearTimeout(toastTimer);
+        els.toast.textContent = text;
+        els.toast.classList.add("show");
+        toastTimer = setTimeout(() => {
+          els.toast.classList.remove("show");
+        }, 1000);
+      }
+
+      function formatSkillNames(skillNames) {
+        if (!Array.isArray(skillNames) || !skillNames.length) return "新的 skill";
+        return skillNames.join(", ");
       }
 
       function outputAudioEnabled() {
@@ -856,7 +925,7 @@
             body: JSON.stringify({
               text,
               model: modelName,
-              prompt: realtimePrompt,
+              prompt: "",
               skillNames: selectedSkills(),
               outputAudio: false,
               history: client.state.history,
@@ -871,6 +940,15 @@
                 raw.slice(0, 500) ||
                 `request failed: ${response.status} ${response.statusText}`,
             );
+          }
+
+          if (data.new_session) {
+            applySelectedSkills(data.selected_skills || [], { replace: true });
+            showToast(`意图识别成功，已切换到 ${formatSkillNames(data.selected_skills)}`);
+            client.state.history = [];
+            resetConversationForRoutedSession(text);
+          } else {
+            applySelectedSkills(data.selected_skills || []);
           }
 
           const answer = data.text || "服务端没有返回文本。";
@@ -999,6 +1077,13 @@
         client.setMode("idle");
       }
 
+      function resetConversationForRoutedSession(userText) {
+        els.conversation.innerHTML = "";
+        appendBubble("user", userText);
+        assistantBubble = appendBubble("assistant", "正在生成...");
+        assistantBubble.classList.add("loading");
+      }
+
       function updateVoiceButton(mode) {
         const active = mode === "recording" || mode === "finalizing" || mode === "speaking";
         els.voiceBtn.classList.toggle("active", active);
@@ -1056,9 +1141,9 @@
           const value = JSON.parse(rawText);
           if (value && typeof value === "object" && !Array.isArray(value)) {
             const field = firstTextField(value, ["content", "soundsName"]);
-            return { historyText: field, speechText: field, isJson: true };
+            return { historyText: rawText, speechText: field, isJson: true };
           }
-          return { historyText: "", speechText: "", isJson: true };
+          return { historyText: rawText, speechText: "", isJson: true };
         } catch {
           return { historyText: rawText, speechText: rawText, isJson: false };
         }

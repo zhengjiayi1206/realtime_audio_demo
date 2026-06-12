@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,6 @@ from fastapi.responses import JSONResponse
 
 from realtime_audio_demo.config import (
     CAPTURE_DIR,
-    DEFAULT_FINAL_PROMPT,
     DEFAULT_PREFILL_MS,
     FINAL_MAX_TOKENS,
     PREFILL_MODE,
@@ -24,6 +24,12 @@ from realtime_audio_demo.services.component_tools import (
     call_component_tool,
     extract_component_call,
     format_component_result,
+)
+from realtime_audio_demo.services.intent_skill_router import (
+    complete_intent_target,
+    extract_json_object,
+    repair_intent_json,
+    select_skill_for_intent,
 )
 from realtime_audio_demo.services.output_filter import normalize_assistant_output
 from realtime_audio_demo.services.qwen import (
@@ -42,14 +48,13 @@ from realtime_audio_demo.utils.audio import float32_sample_count, wav_bytes_from
 
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 
 
 SPEECH_PROMPT = (
     "请把用户输入作为语音播报文本。"
     "只按原文朗读，不要解释、不要改写、不要补充任何内容。"
 )
-
-
 @router.post("/api/realtime/text")
 @router.post("/api/chatbox/text")
 async def chatbox_text(request: Request) -> JSONResponse:
@@ -67,10 +72,7 @@ async def chatbox_text(request: Request) -> JSONResponse:
 
     model = normalize_model_name(payload.get("model") or QWEN_MODEL)
     skill_names = normalize_skill_names(payload.get("skillNames") or [])
-    prompt, used_skills, missing_skills = compose_realtime_prompt(
-        payload.get("prompt") or DEFAULT_FINAL_PROMPT,
-        skill_names,
-    )
+    prompt, used_skills, missing_skills = compose_realtime_prompt("", skill_names)
     history = normalize_history(payload.get("history"))
     output_audio = bool(payload.get("outputAudio"))
     result, status_code = await request_text_completion(
@@ -84,11 +86,63 @@ async def chatbox_text(request: Request) -> JSONResponse:
     if status_code >= 400:
         return JSONResponse(result, status_code=status_code)
 
+    intent_json = extract_json_object(result.get("text"))
+    json_repair: dict[str, Any] | None = None
+    if intent_json is None:
+        intent_json, json_repair = await repair_intent_json(model, result.get("text"))
+        if intent_json is not None:
+            result["text"] = json.dumps(intent_json, ensure_ascii=False, indent=2)
+    intent_target = complete_intent_target(intent_json)
+    logger.info(
+        "chatbox intent route text intent=%s target=%s repaired=%s",
+        json.dumps(intent_json, ensure_ascii=False) if intent_json is not None else None,
+        json.dumps(intent_target, ensure_ascii=False) if intent_target is not None else None,
+        bool(json_repair),
+    )
+    selected_skill: str | None = None
+    skill_selection: dict[str, Any] | None = None
+    new_session = False
+    if intent_json and intent_target:
+        selected_skill, skill_selection = await select_skill_for_intent(model, intent_json)
+        if selected_skill:
+            routed_skill_names = [selected_skill]
+            prompt, used_skills, missing_skills = compose_realtime_prompt("", routed_skill_names)
+            routed_user_text = (
+                f"用户原始输入：{user_text}\n\n"
+                f"意图识别结果：{json.dumps(intent_json, ensure_ascii=False)}"
+            )
+            routed_result, routed_status_code = await request_text_completion(
+                model=model,
+                text=routed_user_text,
+                prompt=prompt,
+                history=[],
+                max_tokens=FINAL_MAX_TOKENS,
+                output_audio=False,
+            )
+            if routed_status_code < 400:
+                result = routed_result
+                skill_names = routed_skill_names
+                new_session = True
+            else:
+                result["skill_routing_error"] = routed_result
+
     normalized = normalize_assistant_output(result.get("text"))
     result["history_text"] = normalized.history_text
-    result["speech_text"] = normalized.history_text
+    result["speech_text"] = normalized.speech_text
     result["output_is_json"] = normalized.is_json
-    result.update({"skills": used_skills, "missing_skills": missing_skills, "output_audio": output_audio})
+    result.update(
+        {
+            "skills": used_skills,
+            "missing_skills": missing_skills,
+            "output_audio": output_audio,
+            "intent_target": intent_target,
+            "json_repair": json_repair,
+            "selected_skill": selected_skill,
+            "selected_skills": [selected_skill] if selected_skill else [],
+            "skill_selection": skill_selection,
+            "new_session": new_session,
+        }
+    )
     return JSONResponse(result)
 
 
@@ -109,6 +163,97 @@ async def chatbox_speech(request: Request) -> JSONResponse:
     model = normalize_model_name(payload.get("model") or QWEN_MODEL)
     audio_data_url = await synthesize_speech_audio(model, text)
     return JSONResponse({"audio_data_url": audio_data_url})
+
+
+async def maybe_route_chatbox_voice_intent(
+    *,
+    model: str,
+    assistant_text: str | None,
+    skill_names: list[str],
+) -> tuple[str | None, str, dict[str, Any]]:
+    meta: dict[str, Any] = {
+        "intent_target": None,
+        "json_repair": None,
+        "selected_skill": None,
+        "selected_skills": [],
+        "skill_selection": None,
+        "new_session": False,
+        "skills": [],
+        "missing_skills": [],
+    }
+    user_history_text = "[用户通过语音输入了一条消息]"
+    if not assistant_text:
+        return assistant_text, user_history_text, meta
+
+    intent_json = extract_json_object(assistant_text)
+    if intent_json is None:
+        intent_json, meta["json_repair"] = await repair_intent_json(model, assistant_text)
+        if intent_json is not None:
+            assistant_text = json.dumps(intent_json, ensure_ascii=False, indent=2)
+
+    if intent_json:
+        user_history_text = format_voice_user_history(intent_json)
+
+    intent_target = complete_intent_target(intent_json)
+    meta["intent_target"] = intent_target
+    logger.info(
+        "chatbox intent route voice intent=%s target=%s repaired=%s",
+        json.dumps(intent_json, ensure_ascii=False) if intent_json is not None else None,
+        json.dumps(intent_target, ensure_ascii=False) if intent_target is not None else None,
+        bool(meta["json_repair"]),
+    )
+    if not intent_json or not intent_target:
+        return assistant_text, user_history_text, meta
+
+    selected_skill, skill_selection = await select_skill_for_intent(model, intent_json)
+    meta["selected_skill"] = selected_skill
+    meta["selected_skills"] = [selected_skill] if selected_skill else []
+    meta["skill_selection"] = skill_selection
+    if not selected_skill:
+        return assistant_text, user_history_text, meta
+
+    routed_skill_names = [selected_skill]
+    prompt, used_skills, missing_skills = compose_realtime_prompt("", routed_skill_names)
+    routed_user_text = (
+        f"用户语音输入的结构化意图：{user_history_text}\n\n"
+        f"意图识别结果：{json.dumps(intent_json, ensure_ascii=False)}"
+    )
+    routed_result, routed_status_code = await request_text_completion(
+        model=model,
+        text=routed_user_text,
+        prompt=prompt,
+        history=[],
+        max_tokens=FINAL_MAX_TOKENS,
+        output_audio=False,
+    )
+    if routed_status_code < 400:
+        meta["new_session"] = True
+        meta["skills"] = used_skills
+        meta["missing_skills"] = missing_skills
+        return routed_result.get("text"), user_history_text, meta
+
+    meta["skill_routing_error"] = routed_result
+    return assistant_text, user_history_text, meta
+
+
+def format_voice_user_history(intent_json: dict[str, Any]) -> str:
+    content = str(intent_json.get("content") or "").strip()
+    intention = str(intent_json.get("intention") or "").strip()
+    if not intention:
+        target = intent_json.get("target")
+        if isinstance(target, dict):
+            intention = (
+                f"target.name={target.get('name') or ''}#"
+                f"target.params1={target.get('params1') or ''}#"
+                f"target.params2={target.get('params2') or ''}"
+            )
+    if content and intention:
+        return f"语音输入意图：{intention}；模型追问/确认：{content}"
+    if intention:
+        return f"语音输入意图：{intention}"
+    if content:
+        return f"语音输入内容：{content}"
+    return "[用户通过语音输入了一条消息]"
 
 
 @router.post("/api/chatbox/components/call")
@@ -223,12 +368,15 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
         session.source_sample_rate = int(payload.get("sampleRate") or session.source_sample_rate)
         session.prefill_ms = int(payload.get("prefillMs") or DEFAULT_PREFILL_MS)
         session.model = normalize_model_name(payload.get("model") or QWEN_MODEL)
+        session.route_context = str(payload.get("routeContext") or "").strip()
         session.output_audio = bool(payload.get("outputAudio"))
         session.stream_speech_audio = bool(payload.get("streamSpeechAudio"))
         await configure_vad(session, payload.get("vad"))
         skill_names = normalize_skill_names(payload.get("skillNames") or [])
+        session.skill_names = skill_names
+        base_prompt = "" if session.route_context == "chatbox" else payload.get("prompt") or session.prompt
         session.prompt, used_skills, missing_skills = compose_realtime_prompt(
-            payload.get("prompt") or session.prompt,
+            base_prompt,
             skill_names,
         )
         session.history = normalize_history(payload.get("history"))
@@ -629,9 +777,18 @@ async def finalize_session(session: AudioSession) -> None:
 
     data = response.json()
     parsed = extract_model_output(data)
-    text, component_call, component_result = await resolve_component_output(session, parsed["text"])
+    text = parsed["text"]
+    user_history_text = "[用户通过语音输入了一条消息]"
+    routing_meta: dict[str, Any] = {}
+    if session.route_context == "chatbox":
+        text, user_history_text, routing_meta = await maybe_route_chatbox_voice_intent(
+            model=session.model,
+            assistant_text=text,
+            skill_names=session.skill_names,
+        )
+    text, component_call, component_result = await resolve_component_output(session, text)
     normalized = normalize_assistant_output(text)
-    audio_data_url = await synthesize_speech_audio(session.model, normalized.history_text) if session.output_audio else None
+    audio_data_url = await synthesize_speech_audio(session.model, normalized.speech_text) if session.output_audio else None
     await send_event(
         session,
         "final_result",
@@ -639,10 +796,12 @@ async def finalize_session(session: AudioSession) -> None:
             "text": text,
             "audio_data_url": audio_data_url,
             "history_text": normalized.history_text,
-            "speech_text": normalized.history_text,
+            "speech_text": normalized.speech_text,
+            "user_history_text": user_history_text,
             "output_is_json": normalized.is_json,
             "component_call": component_call,
             "component_result": component_result,
+            **routing_meta,
             "raw_response": data,
             "saved_input_wav": str(input_path),
             "latency_ms": latency_ms,
@@ -767,6 +926,14 @@ async def stream_final_session(
         await task
 
     text = "".join(text_parts).strip() or None
+    user_history_text = "[用户通过语音输入了一条消息]"
+    routing_meta: dict[str, Any] = {}
+    if session.route_context == "chatbox":
+        text, user_history_text, routing_meta = await maybe_route_chatbox_voice_intent(
+            model=session.model,
+            assistant_text=text,
+            skill_names=session.skill_names,
+        )
     text, component_call, component_result = await resolve_component_output(session, text)
     normalized = normalize_assistant_output(text)
 
@@ -778,7 +945,7 @@ async def stream_final_session(
 
     audio_data_url = None
     if session.output_audio and audio_count == 0:
-        audio_data_url = await synthesize_speech_audio(session.model, normalized.history_text)
+        audio_data_url = await synthesize_speech_audio(session.model, normalized.speech_text)
     await send_event(
         session,
         "final_result",
@@ -787,10 +954,12 @@ async def stream_final_session(
             "audio_data_url": audio_data_url,
             "audio_chunks": audio_count,
             "history_text": normalized.history_text,
-            "speech_text": normalized.history_text,
+            "speech_text": normalized.speech_text,
+            "user_history_text": user_history_text,
             "output_is_json": normalized.is_json,
             "component_call": component_call,
             "component_result": component_result,
+            **routing_meta,
             "raw_response": None,
             "saved_input_wav": str(input_path),
             "latency_ms": int((time.perf_counter() - start) * 1000),

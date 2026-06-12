@@ -84,14 +84,27 @@ def stream_json_sync(url: str, payload: dict[str, Any], push: Any) -> None:
         push({"type": "error", "message": str(exc)})
 
 
-def history_messages(history: Optional[list[dict[str, str]]] = None) -> list[dict[str, Any]]:
+def history_messages(history: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for item in history or []:
         role = item.get("role")
-        content = item.get("content")
+        content = history_item_content(item)
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
     return messages
+
+
+def history_item_content(item: dict[str, Any]) -> str:
+    extra = {key: value for key, value in item.items() if key != "role"}
+    if len(extra) > 1:
+        return json.dumps(extra, ensure_ascii=False)
+
+    content = item.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False)
 
 
 def apply_provider_options(
@@ -111,7 +124,7 @@ def build_chat_payload(
     wav_bytes: bytes,
     prompt: str,
     *,
-    history: Optional[list[dict[str, str]]] = None,
+    history: Optional[list[dict[str, Any]]] = None,
     max_tokens: int,
     modalities: Optional[list[str]] = None,
 ) -> dict[str, Any]:
@@ -130,7 +143,11 @@ def build_chat_payload(
             "audio": f"data:audio/wav;base64,{audio_b64}",
         }
 
-    messages = history_messages(history)
+    messages: list[dict[str, Any]] = []
+    prompt = prompt.strip()
+    if prompt:
+        messages.append({"role": "system", "content": prompt})
+    messages.extend(history_messages(history))
     messages.append(
         {
             "role": "user",
@@ -138,7 +155,7 @@ def build_chat_payload(
                 audio_item,
                 {
                     "type": "text",
-                    "text": prompt,
+                    "text": "请理解这段语音输入，并直接回答用户。",
                 },
             ],
         }
@@ -160,7 +177,7 @@ def build_text_payload(
     user_text: str,
     prompt: str,
     *,
-    history: Optional[list[dict[str, str]]] = None,
+    history: Optional[list[dict[str, Any]]] = None,
     max_tokens: int,
     modalities: Optional[list[str]] = None,
 ) -> dict[str, Any]:
@@ -195,10 +212,9 @@ def normalize_history(value: Any) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         role = item.get("role")
-        content = item.get("content")
-        if role not in {"user", "assistant"} or not isinstance(content, str):
+        if role not in {"user", "assistant"}:
             continue
-        content = content.strip()
+        content = history_item_content(item)
         if content:
             items.append({"role": role, "content": content[:4000]})
 

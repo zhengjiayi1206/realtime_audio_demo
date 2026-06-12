@@ -8,12 +8,14 @@ export class RealtimeAudioClient extends EventTarget {
       getModel: () => "",
       getPrompt: () => "",
       getPrefillMs: () => 600,
+      getRouteContext: () => "",
       getSkillNames: () => [],
       getOutputAudio: () => false,
       getStreamSpeechAudio: () => false,
       getVadConfig: () => null,
       getBargeInVadConfig: () => null,
       getVadMonitorWebSocketUrl: defaultVadMonitorWebSocketUrl,
+      shouldAutoStopOnVad: () => true,
       useWebAudioPlayback: false,
       enableBargeIn: false,
       bargeInAfterFinalResultOnly: false,
@@ -47,6 +49,7 @@ export class RealtimeAudioClient extends EventTarget {
       finalReceived: false,
       finalText: "",
       finalHistoryText: "",
+      finalUserText: "",
       historySavedForTurn: false,
       interrupted: false,
       streamedAudioCount: 0,
@@ -156,6 +159,7 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.finalReceived = false;
     this.state.finalText = "";
     this.state.finalHistoryText = "";
+    this.state.finalUserText = "";
     this.state.historySavedForTurn = false;
     this.state.interrupted = false;
     this.state.bargeInTriggered = false;
@@ -219,6 +223,7 @@ export class RealtimeAudioClient extends EventTarget {
         prefillMs: chunkMs,
         model: this.options.getModel().trim(),
         prompt: this.options.getPrompt().trim(),
+        routeContext: this.options.getRouteContext(),
         skillNames: this.options.getSkillNames(),
         outputAudio: Boolean(this.options.getOutputAudio()),
         streamSpeechAudio: Boolean(this.options.getStreamSpeechAudio()),
@@ -568,6 +573,7 @@ export class RealtimeAudioClient extends EventTarget {
       case "vad_speech_end":
         this.setVoiceState("检测到说完，正在推理");
         this.emit("vad", { event: data.event || "speech_end", speaking: false, probability: data.probability });
+        if (!this.options.shouldAutoStopOnVad()) break;
         this.stopRecording().catch((err) => {
           this.log(`server vad stop error: ${err.message || err}`, "error");
           this.setMode("idle");
@@ -628,6 +634,18 @@ export class RealtimeAudioClient extends EventTarget {
   handleFinalResult(data, socket) {
     this.setStatus("完成", true);
     this.state.finalReceived = true;
+    this.state.finalUserText = typeof data.user_history_text === "string" ? data.user_history_text.trim() : "";
+    const userDisplayText = typeof data.user_display_text === "string" ? data.user_display_text.trim() : "";
+    if (userDisplayText) {
+      this.emit("userTranscript", { text: userDisplayText });
+    }
+    if (data.new_session) {
+      this.emit("routedSession", {
+        selected_skills: data.selected_skills || [],
+        selected_skill: data.selected_skill || "",
+        user_text: userDisplayText || "语音输入已提交",
+      });
+    }
     const currentText = this.getDisplayedText();
     if (data.text) {
       this.state.finalText = data.text;
@@ -856,7 +874,8 @@ export class RealtimeAudioClient extends EventTarget {
   rememberTurn(assistantText) {
     const text = (assistantText || "").trim();
     if (!text) return;
-    this.appendHistoryTurn("[用户上一轮通过语音输入了一条消息]", text);
+    const userText = this.state.finalUserText || "[用户上一轮通过语音输入了一条消息]";
+    this.appendHistoryTurn(userText, text);
   }
 
   rememberTextTurn(userText, assistantText) {

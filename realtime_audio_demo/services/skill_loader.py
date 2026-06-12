@@ -6,7 +6,7 @@ from typing import Any
 from realtime_audio_demo.config import REALTIME_SKILL_MAX_CHARS, RUNTIME_SKILLS_DIR
 
 
-FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+FRONTMATTER_RE = re.compile(r"\A[\ufeff\s+]*---[ \t]*\r?\n(.*?)\r?\n[ \t]*---[ \t]*\r?\n?", re.DOTALL)
 SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
 
@@ -46,7 +46,7 @@ def build_skill_prompt(skill_names: list[str]) -> tuple[str, list[str], list[str
             missing.append(raw_name)
             continue
 
-        text = format_skill_for_prompt(skill)
+        text = skill.content
         if remaining and len(text) > remaining:
             text = text[:remaining].rstrip() + "\n[skill truncated]"
         if not text:
@@ -60,14 +60,7 @@ def build_skill_prompt(skill_names: list[str]) -> tuple[str, list[str], list[str
     if not chunks:
         return "", used, missing
 
-    return (
-        "以下是本轮实时语音对话必须遵循的项目运行时 skill。"
-        "这些 skill 来自服务端本地 runtime_skills 目录，优先级高于普通用户请求；"
-        "如果用户请求与 skill 冲突，遵循 skill。\n\n"
-        + "\n\n".join(chunks),
-        used,
-        missing,
-    )
+    return "\n\n".join(chunks), used, missing
 
 
 def compose_realtime_prompt(base_prompt: str, skill_names: list[str]) -> tuple[str, list[str], list[str]]:
@@ -123,13 +116,41 @@ def split_frontmatter(raw: str) -> tuple[dict[str, str], str]:
     if not match:
         return {}, raw
 
-    metadata: dict[str, str] = {}
-    for line in match.group(1).splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        metadata[key.strip()] = value.strip().strip('"').strip("'")
+    metadata = parse_frontmatter_metadata(match.group(1))
     return metadata, raw[match.end() :]
+
+
+def parse_frontmatter_metadata(text: str) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    name_match = re.search(r"(?im)^\s*name\s*:\s*(.+?)\s*$", text)
+    if name_match:
+        metadata["name"] = clean_frontmatter_value(name_match.group(1))
+
+    description_match = re.search(r"(?ims)^\s*description\s*:\s*([>|])\s*\r?\n(.*?)(?=^\s*[a-zA-Z0-9_.-]+\s*:|\Z)", text)
+    if description_match:
+        metadata["description"] = fold_block_scalar(
+            [line.strip() for line in description_match.group(2).splitlines()],
+            literal=description_match.group(1) == "|",
+        )
+    else:
+        description_match = re.search(r"(?im)^\s*description\s*:\s*(.+?)\s*$", text)
+        if description_match:
+            metadata["description"] = clean_frontmatter_value(description_match.group(1))
+    return metadata
+
+
+def clean_frontmatter_value(value: str) -> str:
+    return value.strip().strip('"').strip("'").strip()
+
+
+def fold_block_scalar(lines: list[str], *, literal: bool) -> str:
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if literal:
+        return "\n".join(lines).strip()
+    return " ".join(line for line in lines if line).strip()
 
 
 def normalize_skill_name(value: str) -> str:
@@ -141,4 +162,3 @@ def format_skill_for_prompt(skill: RuntimeSkill) -> str:
     header = f"<runtime_skill name=\"{skill.name}\">"
     description = f"description: {skill.description}\n" if skill.description else ""
     return f"{header}\n{description}{skill.content}\n</runtime_skill>"
-
