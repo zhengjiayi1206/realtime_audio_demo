@@ -9,6 +9,7 @@ export class RealtimeAudioClient extends EventTarget {
       getPrompt: () => "",
       getPrefillMs: () => 600,
       getRouteContext: () => "",
+      getSessionId: () => "",
       getSkillNames: () => [],
       getOutputAudio: () => false,
       getStreamSpeechAudio: () => false,
@@ -39,8 +40,6 @@ export class RealtimeAudioClient extends EventTarget {
       startedAt: 0,
       chunks: 0,
       prefillOk: 0,
-      history: [],
-      maxHistoryTurns: 10,
       audioQueue: [],
       audioPlaying: false,
       currentAudio: null,
@@ -50,7 +49,7 @@ export class RealtimeAudioClient extends EventTarget {
       finalText: "",
       finalHistoryText: "",
       finalUserText: "",
-      historySavedForTurn: false,
+      interruptedAssistantText: "",
       interrupted: false,
       streamedAudioCount: 0,
       streamingTextStarted: false,
@@ -125,7 +124,6 @@ export class RealtimeAudioClient extends EventTarget {
     const response = await fetch(this.options.healthUrl);
     if (!response.ok) throw new Error(`health check failed: ${response.status}`);
     const config = await response.json();
-    this.state.maxHistoryTurns = Number(config.max_history_turns || 10);
     this.emit("config", { config });
     this.log(
       `config model=${config.model} provider=${config.provider} prefill=${config.prefill_mode}`,
@@ -160,7 +158,6 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.finalText = "";
     this.state.finalHistoryText = "";
     this.state.finalUserText = "";
-    this.state.historySavedForTurn = false;
     this.state.interrupted = false;
     this.state.bargeInTriggered = false;
     this.state.vad = this.createVadState();
@@ -216,6 +213,9 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.node.connect(this.state.sink);
     this.state.sink.connect(this.state.audioContext.destination);
 
+    const interruptedText = this.state.interruptedAssistantText;
+    this.state.interruptedAssistantText = "";
+
     socket.send(
       JSON.stringify({
         type: "start",
@@ -224,11 +224,12 @@ export class RealtimeAudioClient extends EventTarget {
         model: this.options.getModel().trim(),
         prompt: this.options.getPrompt().trim(),
         routeContext: this.options.getRouteContext(),
+        session_id: this.options.getSessionId(),
         skillNames: this.options.getSkillNames(),
         outputAudio: Boolean(this.options.getOutputAudio()),
         streamSpeechAudio: Boolean(this.options.getStreamSpeechAudio()),
         vad: this.options.getVadConfig(),
-        history: this.state.history,
+        interrupted_assistant_text: interruptedText || "",
       }),
     );
 
@@ -417,7 +418,7 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.interrupted = true;
     const historyText = this.state.playedAssistantText.trim();
     if (historyText) {
-      this.saveCurrentTurnHistory(historyText);
+      this.state.interruptedAssistantText = historyText;
     }
     this.stopBargeInMonitor();
     this.stopPlayback();
@@ -664,7 +665,6 @@ export class RealtimeAudioClient extends EventTarget {
       this.enqueueAudio(data.audio_data_url, this.state.streamedAudioCount + 1, this.state.finalHistoryText);
     } else if (this.state.streamedAudioCount === 0) {
       this.setVoiceState("播报完");
-      this.saveCurrentTurnHistory(this.state.finalHistoryText || this.state.finalText || this.getDisplayedText());
       this.log("没有解析到音频输出。确认模型服务启用了音频输出和 stream。");
     }
 
@@ -676,9 +676,6 @@ export class RealtimeAudioClient extends EventTarget {
         });
       }
     } else {
-      this.saveCurrentTurnHistory(
-        this.state.finalHistoryText || this.state.finalText || this.state.playedAssistantText || this.getDisplayedText(),
-      );
       this.setMode("idle");
     }
     this.log(
@@ -721,7 +718,7 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.interrupted = true;
     const historyText = this.state.playedAssistantText.trim();
     if (historyText) {
-      this.saveCurrentTurnHistory(historyText);
+      this.state.interruptedAssistantText = historyText;
     }
     this.stopPlayback();
     this.closeWs();
@@ -770,9 +767,6 @@ export class RealtimeAudioClient extends EventTarget {
       this.state.audioPlaying = false;
       this.state.currentAudio = null;
       if (this.state.finalReceived && !this.state.interrupted) {
-        this.saveCurrentTurnHistory(
-          this.state.finalHistoryText || this.state.finalText || this.state.playedAssistantText || this.getDisplayedText(),
-        );
         this.setMode("idle");
       }
       this.setVoiceState("播报完");
@@ -871,37 +865,8 @@ export class RealtimeAudioClient extends EventTarget {
     return response.arrayBuffer();
   }
 
-  rememberTurn(assistantText) {
-    const text = (assistantText || "").trim();
-    if (!text) return;
-    const userText = this.state.finalUserText || "[用户上一轮通过语音输入了一条消息]";
-    this.appendHistoryTurn(userText, text);
-  }
-
-  rememberTextTurn(userText, assistantText) {
-    const user = (userText || "").trim();
-    const assistant = (assistantText || "").trim();
-    if (!user || !assistant || assistant === "服务端没有返回文本。") return;
-    this.appendHistoryTurn(user, assistant);
-  }
-
-  appendHistoryTurn(userContent, assistantContent) {
-    this.state.history.push({ role: "user", content: userContent });
-    this.state.history.push({ role: "assistant", content: assistantContent });
-    const maxMessages = Math.max(0, this.state.maxHistoryTurns * 2);
-    if (maxMessages && this.state.history.length > maxMessages) {
-      this.state.history = this.state.history.slice(-maxMessages);
-    }
-    this.log(`history saved, messages=${this.state.history.length}`);
-  }
-
-  saveCurrentTurnHistory(assistantText) {
-    if (this.state.historySavedForTurn) return;
-    const text = (assistantText || "").trim();
-    if (!text || text === "模型输出中。" || text === "服务端没有返回文本。") return;
-    this.state.historySavedForTurn = true;
-    this.rememberTurn(text);
-  }
+  // History is now managed on the backend via session_store.
+  // The frontend no longer maintains a local history array.
 }
 
 function defaultWebSocketUrl() {

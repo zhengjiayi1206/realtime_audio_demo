@@ -13,6 +13,7 @@ from realtime_audio_demo.config import DEFAULT_FINAL_PROMPT, DEFAULT_PREFILL_MS,
 class AudioSession:
     websocket: WebSocket
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    chat_session_id: Optional[str] = None
     source_sample_rate: int = 48000
     target_sample_rate: int = TARGET_SAMPLE_RATE
     model: str = QWEN_MODEL

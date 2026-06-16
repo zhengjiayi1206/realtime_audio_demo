@@ -11,6 +11,7 @@ from realtime_audio_demo.config import (
     QWEN_MODEL,
     QWEN_SPEAKER,
     REALTIME_DEFAULT_SKILLS,
+    SESSION_TTL,
     SILERO_VAD_ENABLED,
     SILERO_VAD_MAX_SPEECH_MS,
     SILERO_VAD_MIN_SILENCE_MS,
@@ -89,6 +90,7 @@ async def health(request: Request) -> JSONResponse:
             "realtime_default_skills": REALTIME_DEFAULT_SKILLS,
             "default_prompt": DEFAULT_FINAL_PROMPT,
             "default_chat_prompt": DEFAULT_CHAT_PROMPT,
+            "session_ttl": SESSION_TTL,
         }
     )
 

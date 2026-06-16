@@ -1,10 +1,12 @@
 import asyncio
 import base64
 import json
-import urllib.error
-import urllib.request
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
+
+import httpx
 
 from realtime_audio_demo.config import (
     MAX_HISTORY_TURNS,
@@ -15,11 +17,26 @@ from realtime_audio_demo.config import (
     resolved_provider,
 )
 
+logger = logging.getLogger("uvicorn.error")
+
+_http_client: httpx.Client | None = None
+
+
+def _get_client() -> httpx.Client:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.Client(
+            timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=20),
+        )
+    return _http_client
+
 
 @dataclass
 class JsonResponseData:
     status_code: int
     text: str
+    ttft_ms: Optional[int] = None
 
     def json(self) -> Any:
         return json.loads(self.text)
@@ -31,43 +48,61 @@ async def post_json(url: str, payload: dict[str, Any]) -> JsonResponseData:
 
 def post_json_sync(url: str, payload: dict[str, Any]) -> JsonResponseData:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
+    client = _get_client()
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            text = response.read().decode("utf-8", errors="replace")
-            return JsonResponseData(status_code=response.status, text=text)
-    except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", errors="replace")
-        return JsonResponseData(status_code=exc.code, text=text)
+        response = client.post(
+            url,
+            content=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        return JsonResponseData(
+            status_code=response.status_code,
+            text=response.text,
+            ttft_ms=int(response.elapsed.total_seconds() * 1000),
+        )
+    except httpx.HTTPStatusError as exc:
+        return JsonResponseData(
+            status_code=exc.response.status_code,
+            text=exc.response.text,
+        )
+    except Exception as exc:
+        return JsonResponseData(
+            status_code=502,
+            text=f"upstream request failed: {exc}",
+        )
 
 
 def stream_json_sync(url: str, payload: dict[str, Any], push: Any) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        },
-        method="POST",
-    )
+    client = _get_client()
+    req_start = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            for raw_line in response:
-                line = raw_line.decode("utf-8", errors="replace").strip()
+        with client.stream(
+            "POST",
+            url,
+            content=body,
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        ) as response:
+            if response.status_code >= 400:
+                push({
+                    "type": "error",
+                    "status_code": response.status_code,
+                    "message": response.read().decode("utf-8", errors="replace")[:2000],
+                })
+                return
+
+            first_token = True
+            for raw_line in response.iter_lines():
+                line = raw_line.strip()
                 if not line or line.startswith(":"):
                     continue
                 if not line.startswith("data:"):
                     continue
+                if first_token:
+                    ttft_ms = int((time.perf_counter() - req_start) * 1000)
+                    push({"type": "ttft", "ttft_ms": ttft_ms})
+                    logger.info("stream TTFT=%dms", ttft_ms)
+                    first_token = False
                 data = line[5:].strip()
                 if data == "[DONE]":
                     break
@@ -77,9 +112,12 @@ def stream_json_sync(url: str, payload: dict[str, Any], push: Any) -> None:
                     push({"type": "error", "message": data})
                     return
         push({"type": "done"})
-    except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", errors="replace")
-        push({"type": "error", "status_code": exc.code, "message": text})
+    except httpx.HTTPStatusError as exc:
+        push({
+            "type": "error",
+            "status_code": exc.response.status_code,
+            "message": exc.response.text[:2000],
+        })
     except Exception as exc:
         push({"type": "error", "message": str(exc)})
 

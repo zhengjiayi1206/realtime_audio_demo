@@ -18,27 +18,27 @@
         --accent-soft: #fff1ec;
         --danger: #b42318;
         --shadow: 0 18px 46px rgba(16, 24, 40, 0.08);
+        --sidebar-min: 260px;
+        --sidebar-max: 520px;
+        --sidebar-w: 330px;
       }
 
       * {
         box-sizing: border-box;
       }
 
-      html,
-      body {
+      html, body {
         height: 100%;
       }
 
       body {
         margin: 0;
-        font-family:
-          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         background: var(--bg);
         color: var(--text);
       }
 
-      button,
-      textarea {
+      button, textarea {
         font: inherit;
       }
 
@@ -51,25 +51,104 @@
         opacity: 0.55;
       }
 
+      /* ── layout ── */
       .app-shell {
         height: 100vh;
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) 330px;
+        display: flex;
         overflow: hidden;
       }
 
       .chat-main {
+        flex: 1 1 0;
         min-width: 0;
-        min-height: 0;
         display: grid;
         grid-template-rows: 1fr auto auto;
         padding: 28px 38px 22px;
       }
 
+      /* ── resize handle ── */
+      .resize-handle {
+        width: 6px;
+        cursor: col-resize;
+        background: transparent;
+        flex: 0 0 auto;
+        position: relative;
+        z-index: 10;
+        transition: background 120ms;
+      }
+      .resize-handle:hover,
+      .resize-handle.active {
+        background: var(--accent);
+        opacity: 0.5;
+      }
+
+      /* ── sidebar ── */
+      .agent-panel {
+        width: var(--sidebar-w);
+        min-width: var(--sidebar-min);
+        max-width: var(--sidebar-max);
+        flex: 0 0 auto;
+        border-left: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+        display: grid;
+        grid-template-rows: auto auto auto minmax(200px, 1fr) auto;
+        gap: 14px;
+        padding: 16px 20px 18px;
+        overflow: auto;
+        transition: width 120ms ease, min-width 120ms ease, padding 120ms ease, opacity 200ms ease;
+      }
+
+      .sidebar-collapsed .agent-panel {
+        width: 0;
+        min-width: 0;
+        max-width: 0;
+        padding: 16px 0;
+        border-left: 0;
+        opacity: 0;
+        pointer-events: none;
+        overflow: hidden;
+      }
+      .sidebar-collapsed .resize-handle {
+        display: none;
+      }
+
+      /* ── sidebar toggle button (outside panel) ── */
+      .sidebar-toggle {
+        position: absolute;
+        top: 16px;
+        right: 12px;
+        z-index: 11;
+        width: 30px;
+        height: 30px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: #475467;
+        font-size: 16px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+      }
+      .sidebar-collapsed .sidebar-toggle {
+        right: -8px;
+        border-radius: 0 6px 6px 0;
+        border-left: 0;
+      }
+      .sidebar-toggle {
+        display: none;
+      }
+      @media (max-width: 920px) {
+        .sidebar-toggle {
+          display: grid;
+        }
+      }
+
+      /* ── conversation ── */
       .conversation {
         min-height: 0;
         overflow: auto;
         padding: 14px 6px 24px;
+        scroll-behavior: smooth;
       }
 
       .welcome {
@@ -83,14 +162,15 @@
 
       .message {
         display: grid;
-        grid-template-columns: 34px minmax(0, 780px);
+        grid-template-columns: 34px minmax(0, 1fr);
         gap: 12px;
         margin: 0 auto 22px;
         width: min(920px, 100%);
+        max-width: 100%;
       }
 
       .message.user {
-        grid-template-columns: minmax(0, 780px) 34px;
+        grid-template-columns: minmax(0, 1fr) 34px;
       }
 
       .avatar {
@@ -150,6 +230,7 @@
         font-size: 13px;
       }
 
+      /* ── composer ── */
       .composer {
         width: min(1160px, 100%);
         margin: 0 auto;
@@ -183,6 +264,7 @@
         gap: 12px;
         min-height: 54px;
         padding: 6px 12px 12px;
+        flex-wrap: wrap;
       }
 
       .input-modes {
@@ -198,6 +280,7 @@
         height: 8px;
         border-radius: 50%;
         background: #98a2b3;
+        flex: 0 0 auto;
       }
 
       .status-dot.ok {
@@ -264,17 +347,7 @@
         background: var(--accent-dark);
       }
 
-      .agent-panel {
-        min-height: 0;
-        border-left: 1px solid var(--line);
-        background: rgba(255, 255, 255, 0.86);
-        display: grid;
-        grid-template-rows: auto auto auto minmax(360px, 1fr) auto;
-        gap: 14px;
-        padding: 16px 20px 18px;
-        overflow: auto;
-      }
-
+      /* ── panel internals ── */
       .panel-close {
         justify-self: end;
         width: 34px;
@@ -330,22 +403,11 @@
         background: var(--panel-soft);
       }
 
-      .skill-panel {
-        min-height: 0;
-        display: grid;
-        gap: 10px;
-      }
-
-      .option-panel {
-        display: grid;
-        gap: 10px;
-      }
+      .skill-panel { display: grid; gap: 10px; min-height: 0; }
+      .option-panel { display: grid; gap: 10px; }
 
       .option-panel h2 {
-        margin: 0;
-        color: #344054;
-        font-size: 15px;
-        letter-spacing: 0;
+        margin: 0; color: #344054; font-size: 15px; letter-spacing: 0;
       }
 
       .system-textarea {
@@ -378,210 +440,144 @@
         background: #fff;
       }
 
-      .switch-copy {
-        display: grid;
-        gap: 2px;
-      }
-
-      .switch-copy strong {
-        font-size: 13px;
-      }
-
-      .switch-copy small {
-        color: var(--muted);
-        font-size: 12px;
-        line-height: 1.35;
-      }
+      .switch-copy { display: grid; gap: 2px; }
+      .switch-copy strong { font-size: 13px; }
+      .switch-copy small { color: var(--muted); font-size: 12px; line-height: 1.35; }
 
       .switch {
-        position: relative;
-        width: 42px;
-        height: 24px;
-        flex: 0 0 auto;
+        position: relative; width: 42px; height: 24px; flex: 0 0 auto;
       }
-
-      .switch input {
-        opacity: 0;
-        width: 0;
-        height: 0;
-      }
-
+      .switch input { opacity: 0; width: 0; height: 0; }
       .switch span {
-        position: absolute;
-        inset: 0;
-        border-radius: 999px;
-        background: #d0d5dd;
-        transition: background 160ms ease;
+        position: absolute; inset: 0; border-radius: 999px;
+        background: #d0d5dd; transition: background 160ms ease;
       }
-
       .switch span::before {
         content: "";
-        position: absolute;
-        width: 18px;
-        height: 18px;
-        left: 3px;
-        top: 3px;
-        border-radius: 50%;
-        background: #fff;
+        position: absolute; width: 18px; height: 18px; left: 3px; top: 3px;
+        border-radius: 50%; background: #fff;
         box-shadow: 0 1px 4px rgba(16, 24, 40, 0.2);
         transition: transform 160ms ease;
       }
-
-      .switch input:checked + span {
-        background: var(--accent);
-      }
-
-      .switch input:checked + span::before {
-        transform: translateX(18px);
-      }
+      .switch input:checked + span { background: var(--accent); }
+      .switch input:checked + span::before { transform: translateX(18px); }
 
       .skill-panel h2 {
-        margin: 0;
-        color: #344054;
-        font-size: 15px;
-        letter-spacing: 0;
+        margin: 0; color: #344054; font-size: 15px; letter-spacing: 0;
       }
 
       .skill-list {
-        display: grid;
-        align-content: start;
-        gap: 8px;
-        min-height: 0;
-        overflow: auto;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        padding: 10px;
-        background: #fff;
+        display: grid; align-content: start; gap: 8px; min-height: 0;
+        overflow: auto; border: 1px solid var(--line); border-radius: 8px;
+        padding: 10px; background: #fff;
       }
 
       .skill-empty {
-        color: var(--muted);
-        font-size: 13px;
-        line-height: 1.5;
-        padding: 4px 2px;
+        color: var(--muted); font-size: 13px; line-height: 1.5; padding: 4px 2px;
       }
 
       .skill-item {
-        display: grid;
-        grid-template-columns: auto 1fr;
-        gap: 9px;
-        align-items: start;
-        border: 1px solid #edf1f7;
-        border-radius: 8px;
-        padding: 9px;
-        font-size: 13px;
+        display: grid; grid-template-columns: auto 1fr; gap: 9px; align-items: start;
+        border: 1px solid #edf1f7; border-radius: 8px; padding: 9px; font-size: 13px;
       }
 
       .skill-item input {
-        width: 16px;
-        height: 16px;
-        margin-top: 2px;
-        accent-color: var(--accent);
+        width: 16px; height: 16px; margin-top: 2px; accent-color: var(--accent);
       }
 
-      .skill-meta {
-        display: grid;
-        gap: 3px;
-        min-width: 0;
+      .skill-item.locked {
+        border-color: var(--accent);
+        background: var(--accent-soft);
       }
 
-      .skill-meta strong {
-        overflow-wrap: anywhere;
-      }
+      .skill-meta { display: grid; gap: 3px; min-width: 0; }
+      .skill-meta strong { overflow-wrap: anywhere; }
+      .skill-meta small { color: var(--muted); line-height: 1.35; overflow-wrap: anywhere; }
 
-      .skill-meta small {
-        color: var(--muted);
-        line-height: 1.35;
-        overflow-wrap: anywhere;
+      .locked-badge {
+        display: inline-block;
+        background: var(--accent);
+        color: #fff;
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        margin-left: 4px;
+        vertical-align: middle;
       }
 
       .toast {
-        position: fixed;
-        left: 50%;
-        bottom: 28px;
-        z-index: 20;
-        transform: translate(-50%, 12px);
-        opacity: 0;
-        pointer-events: none;
-        border: 1px solid rgba(16, 24, 40, 0.08);
-        border-radius: 8px;
-        padding: 10px 14px;
-        background: rgba(16, 24, 40, 0.92);
-        color: #fff;
+        position: fixed; left: 50%; bottom: 28px; z-index: 20;
+        transform: translate(-50%, 12px); opacity: 0; pointer-events: none;
+        border: 1px solid rgba(16, 24, 40, 0.08); border-radius: 8px;
+        padding: 10px 14px; background: rgba(16, 24, 40, 0.92); color: #fff;
         box-shadow: 0 12px 28px rgba(16, 24, 40, 0.22);
-        font-size: 13px;
-        line-height: 1.4;
+        font-size: 13px; line-height: 1.4;
         transition: opacity 160ms ease, transform 160ms ease;
       }
 
-      .toast.show {
-        opacity: 1;
-        transform: translate(-50%, 0);
-      }
+      .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
-      .side-actions {
-        display: grid;
-        gap: 10px;
-      }
+      .side-actions { display: grid; gap: 10px; }
 
       .side-button {
-        min-height: 44px;
-        border-radius: 8px;
-        border: 1px solid var(--line);
-        background: #fff;
-        color: #475467;
+        min-height: 44px; border-radius: 8px; border: 1px solid var(--line);
+        background: #fff; color: #475467;
       }
 
       .side-button.primary {
-        border-color: var(--accent);
-        background: var(--accent);
-        color: #fff;
+        border-color: var(--accent); background: var(--accent); color: #fff;
       }
 
-      .side-button.danger {
-        color: var(--danger);
-      }
+      .side-button.danger { color: var(--danger); }
 
-      .panel-hidden .agent-panel {
-        display: none;
-      }
-
-      .panel-hidden .app-shell {
-        grid-template-columns: 1fr;
+      /* ── responsive ── */
+      @media (max-width: 1100px) {
+        .chat-main { padding: 18px 18px 16px; }
+        :root { --sidebar-w: 280px; --sidebar-min: 240px; }
       }
 
       @media (max-width: 920px) {
-        .app-shell {
-          grid-template-columns: 1fr;
-        }
-
-        .chat-main {
-          padding: 18px 12px;
-        }
-
+        .app-shell { flex-direction: column; }
+        .chat-main { padding: 14px 10px 12px; grid-template-rows: 1fr auto auto; }
+        .resize-handle { display: none; }
         .agent-panel {
+          width: 100% !important;
+          min-width: 0 !important;
+          max-width: 100% !important;
+          max-height: 45vh;
           border-left: 0;
           border-top: 1px solid var(--line);
-          max-height: 48vh;
+          grid-template-rows: auto auto auto auto auto;
+          gap: 10px;
+          padding: 12px 14px;
         }
+        .sidebar-collapsed .agent-panel {
+          max-height: 0;
+          padding: 0 14px;
+        }
+        .sidebar-collapsed .resize-handle { display: none; }
+        .sidebar-toggle { display: grid; }
+        .agent-summary { display: none; }
+        .message, .message.user {
+          grid-template-columns: 28px minmax(0, 1fr);
+        }
+        .message.user .avatar { grid-column: 1; }
+        .message.user .bubble { justify-self: start; }
+        .composer textarea { min-height: 72px; max-height: 140px; }
+        .call-button { min-width: 90px; font-size: 12px; }
+      }
 
-        .message,
-        .message.user {
-          grid-template-columns: 30px minmax(0, 1fr);
-        }
-
-        .message.user .avatar {
-          grid-column: 1;
-        }
-
-        .message.user .bubble {
-          justify-self: start;
-        }
+      @media (max-width: 600px) {
+        .chat-main { padding: 10px 6px 10px; }
+        .composer-bar { gap: 6px; min-height: 44px; padding: 4px 8px 10px; }
+        .message { gap: 8px; margin-bottom: 16px; }
+        .bubble { padding: 10px 12px; font-size: 14px; }
+        .agent-panel { max-height: 40vh; padding: 10px 10px; }
       }
     </style>
   </head>
   <body>
-    <div class="app-shell">
+    <div class="app-shell" id="appShell">
       <main class="chat-main">
         <section class="conversation" id="conversation">
           <div class="welcome">有什么可以帮你？</div>
@@ -599,6 +595,7 @@
               <span id="statusText">idle</span>
             </div>
             <div class="tool-buttons">
+              <button class="icon-button" id="toggleSidebarBtn" type="button" title="切换侧边栏" aria-label="切换侧边栏" style="display:none">☰</button>
               <button class="call-button" id="liveCallBtn" type="button" title="开始实时通话" aria-label="开始实时通话">实时通话</button>
               <button class="icon-button" id="voiceBtn" type="button" title="语音输入" aria-label="语音输入">🎙</button>
               <button class="send-button" id="sendBtn" type="button" title="发送文字" aria-label="发送文字">➤</button>
@@ -607,7 +604,9 @@
         </section>
       </main>
 
-      <aside class="agent-panel">
+      <div class="resize-handle" id="resizeHandle" aria-hidden="true"></div>
+
+      <aside class="agent-panel" id="agentPanel">
         <button class="panel-close" id="closePanelBtn" type="button" aria-label="收起侧边栏">×</button>
 
         <section class="agent-summary">
@@ -653,6 +652,7 @@
       import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=voice-history-20260612";
 
       const els = {
+        appShell: document.getElementById("appShell"),
         conversation: document.getElementById("conversation"),
         clearBtn: document.getElementById("clearBtn"),
         textInput: document.getElementById("textInput"),
@@ -669,6 +669,9 @@
         closePanelBtn: document.getElementById("closePanelBtn"),
         outputVoiceSwitch: document.getElementById("outputVoiceSwitch"),
         toast: document.getElementById("toast"),
+        resizeHandle: document.getElementById("resizeHandle"),
+        agentPanel: document.getElementById("agentPanel"),
+        toggleSidebarBtn: document.getElementById("toggleSidebarBtn"),
       };
 
       let modelName = "";
@@ -680,7 +683,91 @@
       let restartTimer = null;
       let startInFlight = false;
       let toastTimer = null;
+      let sessionId = crypto.randomUUID();
 
+      /* ── resize handle ── */
+      let resizing = false;
+      let resizeStartX = 0;
+      let resizeStartW = 0;
+
+      function loadPanelWidth() {
+        try {
+          const saved = localStorage.getItem("chatbox-sidebar-width");
+          if (saved) {
+            const w = parseInt(saved, 10);
+            if (w >= 260 && w <= 520) {
+              document.documentElement.style.setProperty("--sidebar-w", w + "px");
+            }
+          }
+        } catch (_) { /* ignore */ }
+      }
+      loadPanelWidth();
+
+      function savePanelWidth(w) {
+        try { localStorage.setItem("chatbox-sidebar-width", String(w)); } catch (_) { /* ignore */ }
+      }
+
+      els.resizeHandle.addEventListener("mousedown", (e) => {
+        if (window.innerWidth <= 920) return;
+        resizing = true;
+        resizeStartX = e.clientX;
+        resizeStartW = els.agentPanel.offsetWidth;
+        els.resizeHandle.classList.add("active");
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+        e.preventDefault();
+      });
+
+      window.addEventListener("mousemove", (e) => {
+        if (!resizing) return;
+        const dx = resizeStartX - e.clientX;
+        let newW = resizeStartW + dx;
+        newW = Math.max(260, Math.min(520, newW));
+        document.documentElement.style.setProperty("--sidebar-w", newW + "px");
+      });
+
+      window.addEventListener("mouseup", () => {
+        if (!resizing) return;
+        resizing = false;
+        els.resizeHandle.classList.remove("active");
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        const finalW = els.agentPanel.offsetWidth;
+        if (finalW >= 260 && finalW <= 520) {
+          savePanelWidth(finalW);
+        }
+      });
+
+      /* ── sidebar toggle (mobile) ── */
+      function sidebarCollapsed() {
+        return els.appShell.classList.contains("sidebar-collapsed");
+      }
+
+      function toggleSidebar() {
+        els.appShell.classList.toggle("sidebar-collapsed");
+        els.toggleSidebarBtn.textContent = sidebarCollapsed() ? "☰" : "✕";
+      }
+
+      els.closePanelBtn.addEventListener("click", () => {
+        if (window.innerWidth <= 920) {
+          toggleSidebar();
+        } else {
+          els.appShell.classList.add("sidebar-collapsed");
+        }
+      });
+
+      els.toggleSidebarBtn.addEventListener("click", toggleSidebar);
+
+      function updateToggleButton() {
+        els.toggleSidebarBtn.style.display = window.innerWidth <= 920 ? "grid" : "none";
+        if (window.innerWidth <= 920 && !sidebarCollapsed()) {
+          // show toggle
+        }
+      }
+      window.addEventListener("resize", updateToggleButton);
+      updateToggleButton();
+
+      /* ── RealtimeAudioClient ── */
       const client = new RealtimeAudioClient({
         useWebAudioPlayback: true,
         enableBargeIn: false,
@@ -689,6 +776,7 @@
         bargeInCooldownMs: 900,
         getModel: () => modelName,
         getPrompt: () => "",
+        getSessionId: () => sessionId,
         getRouteContext: () => "chatbox",
         getPrefillMs: () => 600,
         getDisplayedText: () => assistantBubble?.textContent || "",
@@ -719,7 +807,6 @@
 
       client.on("config", ({ config }) => {
         modelName = config.model || "";
-        client.state.maxHistoryTurns = Number(config.max_history_turns || 10);
       });
 
       client.on("mode", ({ mode }) => {
@@ -790,12 +877,12 @@
       client.on("routedSession", ({ selected_skills, user_text }) => {
         applySelectedSkills(selected_skills || [], { replace: true });
         showToast(`意图识别成功，已切换到 ${formatSkillNames(selected_skills)}`);
-        client.state.history = [];
         if (user_text) {
           resetConversationForRoutedSession(user_text);
         }
       });
 
+      /* ── buttons ── */
       els.liveCallBtn.addEventListener("click", async () => {
         els.liveCallBtn.disabled = true;
         try {
@@ -848,7 +935,6 @@
       els.clearBtn.addEventListener("click", clearConversation);
       els.newChatBtn.addEventListener("click", clearConversation);
       els.deleteChatBtn.addEventListener("click", clearConversation);
-      els.closePanelBtn.addEventListener("click", () => document.body.classList.toggle("panel-hidden"));
       els.outputVoiceSwitch.addEventListener("change", () => {
         if (!outputAudioEnabled()) {
           stopTextAudio();
@@ -856,6 +942,7 @@
         }
       });
 
+      /* ── helpers ── */
       function selectedSkills() {
         return [...els.skills.querySelectorAll("input[type='checkbox']:checked")].map((node) => node.value);
       }
@@ -880,7 +967,7 @@
         els.toast.classList.add("show");
         toastTimer = setTimeout(() => {
           els.toast.classList.remove("show");
-        }, 1000);
+        }, 1500);
       }
 
       function formatSkillNames(skillNames) {
@@ -892,6 +979,7 @@
         return Boolean(els.outputVoiceSwitch.checked);
       }
 
+      /* ── send text ── */
       async function sendTextMessage() {
         const text = els.textInput.value.trim();
         if (!text || textBusy) return;
@@ -926,9 +1014,9 @@
               text,
               model: modelName,
               prompt: "",
+              session_id: sessionId,
               skillNames: selectedSkills(),
               outputAudio: false,
-              history: client.state.history,
             }),
           });
           const raw = await response.text();
@@ -945,36 +1033,17 @@
           if (data.new_session) {
             applySelectedSkills(data.selected_skills || [], { replace: true });
             showToast(`意图识别成功，已切换到 ${formatSkillNames(data.selected_skills)}`);
-            client.state.history = [];
             resetConversationForRoutedSession(text);
           } else {
             applySelectedSkills(data.selected_skills || []);
           }
 
           const answer = data.text || "服务端没有返回文本。";
-          const componentCall = parseComponentCall(answer);
-          if (componentCall) {
-            assistantBubble.textContent = "正在查询开户网点...";
-            setStatus("正在查询开户网点", true);
-            const componentResult = await callComponent(componentCall);
-            const rendered = JSON.stringify(componentResult, null, 2);
-            const normalized = normalizeAssistantOutput(rendered);
-            assistantBubble.classList.remove("loading");
-            assistantBubble.textContent = rendered;
-            client.rememberTextTurn(text, normalized.historyText);
-            if (outputAudioEnabled()) {
-              await playSpeechText(normalized.speechText).catch(() => setStatus("语音输出失败", false));
-            }
-          } else {
-            const normalized = normalizeAssistantOutput(answer);
-            const historyText = data.history_text ?? normalized.historyText;
-            const speechText = data.speech_text ?? normalized.speechText;
-            assistantBubble.classList.remove("loading");
-            assistantBubble.textContent = answer;
-            client.rememberTextTurn(text, historyText);
-            if (outputAudioEnabled()) {
-              await playSpeechText(speechText).catch(() => setStatus("语音输出失败", false));
-            }
+          const speechText = data.speech_text || "";
+          assistantBubble.classList.remove("loading");
+          assistantBubble.textContent = answer;
+          if (outputAudioEnabled()) {
+            await playSpeechText(speechText).catch(() => setStatus("语音输出失败", false));
           }
           setStatus("完成", true);
         } catch (err) {
@@ -988,6 +1057,7 @@
         }
       }
 
+      /* ── load skills ── */
       async function loadSkills() {
         const response = await fetch("/api/chatbox/skills");
         if (!response.ok) throw new Error(`skills load failed: ${response.status}`);
@@ -1015,11 +1085,13 @@
 
           const meta = document.createElement("span");
           meta.className = "skill-meta";
+          const nameWrap = document.createElement("span");
           const name = document.createElement("strong");
           name.textContent = skill.name;
+          nameWrap.appendChild(name);
           const description = document.createElement("small");
           description.textContent = skill.description || `${skill.chars || 0} chars`;
-          meta.appendChild(name);
+          meta.appendChild(nameWrap);
           meta.appendChild(description);
 
           label.appendChild(checkbox);
@@ -1070,7 +1142,7 @@
         client.stopBargeInMonitor();
         client.stopInputDevices();
         client.closeWs();
-        client.state.history = [];
+        sessionId = crypto.randomUUID();
         assistantBubble = null;
         els.conversation.innerHTML = '<div class="welcome">有什么可以帮你？</div>';
         setStatus("idle", false);
@@ -1115,59 +1187,6 @@
         els.sideStatusText.textContent = text;
         els.statusDot.classList.toggle("ok", Boolean(ok));
         els.sideStatusDot.classList.toggle("ok", Boolean(ok));
-      }
-
-      function parseComponentCall(text) {
-        if (!text || !text.includes("call_10901558")) return null;
-        let params = {};
-        try {
-          const value = JSON.parse(text.trim());
-          if (value && value.params && typeof value.params === "object" && !Array.isArray(value.params)) {
-            params = value.params;
-          }
-        } catch {
-          params = {};
-        }
-        return {
-          components: "call_10901558",
-          params,
-        };
-      }
-
-      function normalizeAssistantOutput(text) {
-        const rawText = (text || "").trim();
-        if (!rawText) return { historyText: "", speechText: "", isJson: false };
-        try {
-          const value = JSON.parse(rawText);
-          if (value && typeof value === "object" && !Array.isArray(value)) {
-            const field = firstTextField(value, ["content", "soundsName"]);
-            return { historyText: rawText, speechText: field, isJson: true };
-          }
-          return { historyText: rawText, speechText: "", isJson: true };
-        } catch {
-          return { historyText: rawText, speechText: rawText, isJson: false };
-        }
-      }
-
-      function firstTextField(value, keys) {
-        for (const key of keys) {
-          if (typeof value[key] === "string" && value[key].trim()) return value[key].trim();
-        }
-        return "";
-      }
-
-      async function callComponent(componentCall) {
-        const response = await fetch("/api/chatbox/components/call", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(componentCall),
-        });
-        const raw = await response.text();
-        const data = parseJson(raw);
-        if (!response.ok) {
-          throw new Error(data.message || data.detail || raw.slice(0, 500) || `request failed: ${response.status}`);
-        }
-        return data;
       }
 
       async function playSpeechText(text) {
@@ -1268,7 +1287,7 @@
       }
 
       function scrollToBottom() {
-        els.conversation.scrollTop = els.conversation.scrollHeight;
+        els.conversation.scrollTo({ top: els.conversation.scrollHeight, behavior: "smooth" });
       }
 
       client.loadServerConfig().catch((err) => setStatus(err.message || String(err), false));

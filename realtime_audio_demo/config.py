@@ -32,9 +32,10 @@ SILERO_VAD_MIN_SILENCE_MS = int(os.getenv("SILERO_VAD_MIN_SILENCE_MS", "450"))
 SILERO_VAD_MAX_SPEECH_MS = int(os.getenv("SILERO_VAD_MAX_SPEECH_MS", "30000"))
 SILERO_VAD_SPEECH_PAD_MS = int(os.getenv("SILERO_VAD_SPEECH_PAD_MS", "30"))
 REALTIME_DEFAULT_SKILLS = [
-    item.strip() for item in os.getenv("REALTIME_DEFAULT_SKILLS", "").split(",") if item.strip()
+    item.strip() for item in os.getenv("REALTIME_DEFAULT_SKILLS", "intent-recognition").split(",") if item.strip()
 ]
 REALTIME_SKILL_MAX_CHARS = int(os.getenv("REALTIME_SKILL_MAX_CHARS", "12000"))
+SESSION_TTL = int(os.getenv("SESSION_TTL", "1800"))
 DEFAULT_FINAL_PROMPT = (
     "你正在和用户进行实时语音对话。请直接理解用户想问什么，不要转写、复述或翻译语音内容。"
     "回答要像真人聊天一样自然、口语化、简短，优先用一两句话说清楚。"

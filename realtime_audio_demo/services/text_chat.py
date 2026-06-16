@@ -1,9 +1,12 @@
 import json
+import logging
 import time
 from typing import Any
 
 from realtime_audio_demo.config import QWEN_API_BASE
 from realtime_audio_demo.services.qwen import build_text_payload, extract_model_output, post_json
+
+logger = logging.getLogger("uvicorn.error")
 
 
 async def request_text_completion(
@@ -31,6 +34,15 @@ async def request_text_completion(
         return {"message": str(exc)}, 502
 
     latency_ms = int((time.perf_counter() - start) * 1000)
+    ttft_ms = response.ttft_ms
+
+    logger.info(
+        "text_chat latency=%dms ttft=%s history=%d",
+        latency_ms,
+        ttft_ms if ttft_ms is not None else "n/a",
+        len(history),
+    )
+
     if response.status_code >= 400:
         return (
             {
@@ -52,6 +64,7 @@ async def request_text_completion(
             "text": parsed["text"],
             "audio_data_url": parsed["audio_data_url"],
             "latency_ms": latency_ms,
+            "ttft_ms": ttft_ms,
         },
         200,
     )

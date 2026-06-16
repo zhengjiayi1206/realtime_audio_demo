@@ -44,6 +44,12 @@ from realtime_audio_demo.services.qwen import (
 from realtime_audio_demo.services.skill_loader import compose_realtime_prompt
 from realtime_audio_demo.services.silero_vad import SileroVadConfig, SileroVadSession, SileroVadUnavailable
 from realtime_audio_demo.services.text_chat import request_text_completion
+from realtime_audio_demo.session_store import (
+    append_history,
+    get_session_history,
+    get_session_locked_skill,
+    lock_session_skill,
+)
 from realtime_audio_demo.sessions import AudioSession
 from realtime_audio_demo.utils.audio import float32_sample_count, wav_bytes_from_float32_chunks
 
@@ -67,10 +73,18 @@ async def chatbox_text(request: Request) -> JSONResponse:
     if not user_text:
         return JSONResponse({"message": "text is required"}, status_code=400)
 
+    session_id = str(payload.get("session_id") or "").strip()
     model = normalize_model_name(payload.get("model") or QWEN_MODEL)
-    skill_names = normalize_skill_names(payload.get("skillNames") or [])
+
+    # Use locked skill if present, otherwise use requested skills
+    locked_skill = await get_session_locked_skill(session_id) if session_id else None
+    if locked_skill:
+        skill_names = [locked_skill]
+    else:
+        skill_names = normalize_skill_names(payload.get("skillNames") or [])
+
     prompt, used_skills, missing_skills = compose_realtime_prompt("", skill_names)
-    history = normalize_history(payload.get("history"))
+    history = normalize_history(await get_session_history(session_id)) if session_id else normalize_history(payload.get("history"))
     output_audio = bool(payload.get("outputAudio"))
     result, status_code = await request_text_completion(
         model=model,
@@ -92,6 +106,8 @@ async def chatbox_text(request: Request) -> JSONResponse:
     if intent_json and intent_target:
         selected_skill, skill_selection = await select_skill_for_intent(model, intent_json)
         if selected_skill:
+            if session_id:
+                await lock_session_skill(session_id, selected_skill)
             routed_skill_names = [selected_skill]
             prompt, used_skills, missing_skills = compose_realtime_prompt("", routed_skill_names)
             routed_user_text = (
@@ -113,10 +129,37 @@ async def chatbox_text(request: Request) -> JSONResponse:
             else:
                 result["skill_routing_error"] = routed_result
 
+    # Resolve component output for text path (keep existing frontend behavior)
+    final_text = result.get("text")
+    component_call, component_result = None, None
+    if final_text and "call_10901558" in str(final_text):
+        final_text, component_call, component_result = await resolve_component_output_text(final_text)
+        result["text"] = final_text
+
     normalized = normalize_assistant_output(result.get("text"))
+
+    # When output is intent JSON but no business skill was selected,
+    # use the content field as the displayed text (keep full JSON in history).
+    _intent_text = normalized.history_text
+    if normalized.is_json and not new_session:
+        try:
+            parsed = json.loads(normalized.history_text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+                _display = parsed["content"].strip()
+                if _display:
+                    result["text"] = _display
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     result["history_text"] = normalized.history_text
     result["speech_text"] = normalized.speech_text
     result["output_is_json"] = normalized.is_json
+
+    # Append to session history
+    if session_id:
+        await append_history(session_id, "user", user_text)
+        await append_history(session_id, "assistant", normalized.history_text)
+
     result.update(
         {
             "skills": used_skills,
@@ -128,6 +171,8 @@ async def chatbox_text(request: Request) -> JSONResponse:
             "selected_skills": [selected_skill] if selected_skill else [],
             "skill_selection": skill_selection,
             "new_session": new_session,
+            "session_id": session_id or None,
+            "locked_skill": locked_skill if not new_session else selected_skill,
         }
     )
     return JSONResponse(result)
@@ -153,6 +198,7 @@ async def maybe_route_chatbox_voice_intent(
     model: str,
     assistant_text: str | None,
     skill_names: list[str],
+    session_id: str | None = None,
 ) -> tuple[str | None, str, dict[str, Any]]:
     meta = default_chatbox_routing_meta()
     user_history_text = "[用户通过语音输入了一条消息]"
@@ -176,6 +222,9 @@ async def maybe_route_chatbox_voice_intent(
     meta["skill_selection"] = skill_selection
     if not selected_skill:
         return assistant_text, user_history_text, meta
+
+    if session_id:
+        await lock_session_skill(session_id, selected_skill)
 
     routed_skill_names = [selected_skill]
     prompt, used_skills, missing_skills = compose_realtime_prompt("", routed_skill_names)
@@ -374,14 +423,35 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
         session.output_audio = bool(payload.get("outputAudio"))
         session.stream_speech_audio = bool(payload.get("streamSpeechAudio"))
         await configure_vad(session, payload.get("vad"))
-        skill_names = normalize_skill_names(payload.get("skillNames") or [])
+
+        # Load session_id from client
+        chat_session_id = str(payload.get("session_id") or "").strip()
+        session.chat_session_id = chat_session_id or None
+
+        # If session has locked skill, override skill_names
+        locked_skill = await get_session_locked_skill(chat_session_id) if chat_session_id else None
+        if locked_skill:
+            skill_names = [locked_skill]
+        else:
+            skill_names = normalize_skill_names(payload.get("skillNames") or [])
         session.skill_names = skill_names
+
         base_prompt = "" if session.route_context == "chatbox" else payload.get("prompt") or session.prompt
         session.prompt, used_skills, missing_skills = compose_realtime_prompt(
             base_prompt,
             skill_names,
         )
-        session.history = normalize_history(payload.get("history"))
+
+        # Handle barge-in: append interrupted assistant text to session history
+        if chat_session_id:
+            interrupted_text = str(payload.get("interrupted_assistant_text") or "").strip()
+            if interrupted_text:
+                await append_history(chat_session_id, "assistant", interrupted_text)
+
+        if chat_session_id:
+            session.history = normalize_history(await get_session_history(chat_session_id))
+        else:
+            session.history = normalize_history(payload.get("history"))
         await send_event(
             session,
             "started",
@@ -505,6 +575,22 @@ async def resolve_component_output(
         return text, None, None
 
     await send_event(session, "component_call_started", component_call)
+    result, status_code = await call_component_tool(component_call["components"], component_call["params"])
+    if status_code >= 400:
+        message = result.get("message") or f"component call failed: {status_code}"
+        return f"开户网点查询失败：{message}", component_call, result
+
+    return format_component_result(component_call["components"], result), component_call, result
+
+
+async def resolve_component_output_text(
+    text: str | None,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Resolve component calls for HTTP text path (no WebSocket session)."""
+    component_call = extract_component_call(text)
+    if component_call is None:
+        return text, None, None
+
     result, status_code = await call_component_tool(component_call["components"], component_call["params"])
     if status_code >= 400:
         message = result.get("message") or f"component call failed: {status_code}"
@@ -783,9 +869,28 @@ async def finalize_session(session: AudioSession) -> None:
             model=session.model,
             assistant_text=text,
             skill_names=session.skill_names,
+            session_id=session.chat_session_id,
         )
     text, component_call, component_result = await resolve_component_output(session, text)
     normalized = normalize_assistant_output(text)
+
+    # When output is intent JSON but no business skill was selected,
+    # use the content field as the displayed text.
+    if normalized.is_json and not routing_meta.get("new_session"):
+        try:
+            parsed = json.loads(normalized.history_text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+                _display = parsed["content"].strip()
+                if _display:
+                    text = _display
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Append to session history
+    if session.chat_session_id:
+        await append_history(session.chat_session_id, "user", user_history_text)
+        await append_history(session.chat_session_id, "assistant", normalized.history_text)
+
     audio_data_url = await synthesize_speech_audio(session.model, normalized.speech_text) if session.output_audio else None
     await send_event(
         session,
@@ -855,6 +960,8 @@ async def stream_final_session(
     text_parts: list[str] = []
     buffered_for_component = True
     audio_count = 0
+    stream_ttft_ms: int | None = None
+    first_text_delta = True
     speech_chunker = SpeechTextChunker()
     speech_queue: asyncio.Queue[str | None] = asyncio.Queue()
     stream_speech = session.output_audio and session.stream_speech_audio
@@ -880,6 +987,9 @@ async def stream_final_session(
             item = await queue.get()
             if item.get("type") == "done":
                 break
+            if item.get("type") == "ttft":
+                stream_ttft_ms = item.get("ttft_ms")
+                continue
             if item.get("type") == "error":
                 await send_event(
                     session,
@@ -899,6 +1009,15 @@ async def stream_final_session(
                 continue
             delta = extract_stream_delta(chunk)
             if delta["text"]:
+                if first_text_delta:
+                    first_text_delta = False
+                    if stream_ttft_ms is None:
+                        stream_ttft_ms = int((time.perf_counter() - start) * 1000)
+                    logger.info(
+                        "stream_final TTFT=%dms audio_chunks=%d",
+                        stream_ttft_ms,
+                        len(session.chunks),
+                    )
                 text_parts.append(delta["text"])
                 current_text = "".join(text_parts)
                 if buffered_for_component and not should_buffer_component_candidate(current_text):
@@ -929,9 +1048,27 @@ async def stream_final_session(
             model=session.model,
             assistant_text=text,
             skill_names=session.skill_names,
+            session_id=session.chat_session_id,
         )
     text, component_call, component_result = await resolve_component_output(session, text)
     normalized = normalize_assistant_output(text)
+
+    # When output is intent JSON but no business skill was selected,
+    # use the content field as the displayed text.
+    if normalized.is_json and not routing_meta.get("new_session"):
+        try:
+            parsed = json.loads(normalized.history_text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+                _display = parsed["content"].strip()
+                if _display:
+                    text = _display
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Append to session history
+    if session.chat_session_id:
+        await append_history(session.chat_session_id, "user", user_history_text)
+        await append_history(session.chat_session_id, "assistant", normalized.history_text)
 
     if stream_speech:
         if not component_call:
@@ -957,6 +1094,7 @@ async def stream_final_session(
             input_path=input_path,
             latency_ms=int((time.perf_counter() - start) * 1000),
             audio_chunks=audio_count,
+            ttft_ms=stream_ttft_ms,
         ),
     )
 
@@ -974,6 +1112,7 @@ def build_final_result_payload(
     input_path: Path,
     latency_ms: int,
     audio_chunks: int | None = None,
+    ttft_ms: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "text": text,
@@ -993,6 +1132,7 @@ def build_final_result_payload(
             "raw_response": raw_response,
             "saved_input_wav": str(input_path),
             "latency_ms": latency_ms,
+            "ttft_ms": ttft_ms,
         }
     )
     return payload

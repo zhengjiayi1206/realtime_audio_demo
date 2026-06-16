@@ -50,6 +50,7 @@ def complete_intent_target(value: dict[str, Any] | None) -> dict[str, Any] | Non
         return None
 
     fields = {
+        "action_name": str(target.get("action_name") or "").strip(),
         "name": str(target.get("name") or "").strip(),
         "params1": str(target.get("params1") or "").strip(),
         "params2": str(target.get("params2") or "").strip(),

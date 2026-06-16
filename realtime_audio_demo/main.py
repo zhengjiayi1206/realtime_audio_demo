@@ -8,9 +8,22 @@ from fastapi.staticfiles import StaticFiles
 from realtime_audio_demo.config import SILERO_VAD_ENABLED, SILERO_VAD_PRELOAD, STATIC_DIR
 from realtime_audio_demo.routes import audio, chat, pages
 from realtime_audio_demo.services.silero_vad import SileroVadUnavailable, preload_silero_vad
+from realtime_audio_demo.session_store import cleanup_expired_sessions
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _session_cleanup_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(300)  # every 5 minutes
+        except asyncio.CancelledError:
+            return
+        try:
+            await cleanup_expired_sessions()
+        except Exception:
+            logger.exception("session cleanup failed")
 
 
 @asynccontextmanager
@@ -26,7 +39,16 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             app.state.silero_vad = {"preloaded": False, "error": str(exc)}
             logger.exception("Silero VAD preload failed")
-    yield
+
+    cleanup_task = asyncio.create_task(_session_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 
 def create_app() -> FastAPI:
