@@ -1,3 +1,27 @@
+/* ── 环形缓冲区 ── */
+class AudioRingBuffer {
+  constructor(maxDurationMs = 120000) {
+    this.maxDurationMs = maxDurationMs;
+    this.chunks = [];
+    this.totalDurationMs = 0;
+    this.sampleRate = null;
+  }
+  push(pcmBuffer, sampleRate, chunkDurationMs) {
+    this.sampleRate = sampleRate;
+    this.chunks.push({ pcm: pcmBuffer.slice(0), durationMs: chunkDurationMs });
+    this.totalDurationMs += chunkDurationMs;
+    while (this.totalDurationMs > this.maxDurationMs && this.chunks.length > 1) {
+      this.totalDurationMs -= this.chunks[0].durationMs;
+      this.chunks.shift();
+    }
+  }
+  getSampleRate() { return this.sampleRate; }
+  getChunks() { return this.chunks.map((c) => c.pcm); }
+  getTotalDurationMs() { return this.totalDurationMs; }
+  clear() { this.chunks = []; this.totalDurationMs = 0; this.sampleRate = null; }
+}
+
+
 export class RealtimeAudioClient extends EventTarget {
   constructor(options = {}) {
     super();
@@ -22,6 +46,7 @@ export class RealtimeAudioClient extends EventTarget {
       bargeInAfterFinalResultOnly: false,
       bargeInChunkMs: 120,
       bargeInCooldownMs: 800,
+      bargeInPreBufferMs: 3000,
       autoVad: false,
       vadFrameMs: 50,
       vadThreshold: 0.018,
@@ -32,11 +57,6 @@ export class RealtimeAudioClient extends EventTarget {
     };
     this.state = {
       ws: null,
-      stream: null,
-      audioContext: null,
-      source: null,
-      node: null,
-      sink: null,
       startedAt: 0,
       chunks: 0,
       prefillOk: 0,
@@ -58,15 +78,15 @@ export class RealtimeAudioClient extends EventTarget {
       flushResolve: null,
       playbackContext: null,
       playbackGeneration: 0,
-      bargeInWs: null,
-      bargeInStream: null,
-      bargeInAudioContext: null,
-      bargeInSource: null,
-      bargeInNode: null,
-      bargeInSink: null,
-      bargeInStartedAt: 0,
-      bargeInStarting: false,
       bargeInTriggered: false,
+      preBufferChunks: null,
+      preBufferSampleRate: null,
+      // persistent mic — always on
+      _persistentMic: null,
+      _persistentMicSampleRate: null,
+      _persistentVadWs: null,
+      _ringBuffer: null,
+      _sendingAudio: false,
       vad: this.createVadState(),
     };
     this.setMode("idle");
@@ -84,40 +104,15 @@ export class RealtimeAudioClient extends EventTarget {
     };
   }
 
-  on(type, listener) {
-    this.addEventListener(type, (event) => listener(event.detail));
-  }
-
-  emit(type, detail = {}) {
-    this.dispatchEvent(new CustomEvent(type, { detail }));
-  }
-
-  log(message, level = "") {
-    this.emit("log", { message, level });
-  }
-
-  setStatus(text, ok = false) {
-    this.emit("status", { text, ok });
-  }
-
-  setVoiceState(text) {
-    this.emit("voiceState", { text });
-  }
-
-  setMode(mode) {
-    this.state.mode = mode;
-    this.emit("mode", { mode });
-  }
-
+  on(type, listener) { this.addEventListener(type, (event) => listener(event.detail)); }
+  emit(type, detail = {}) { this.dispatchEvent(new CustomEvent(type, { detail })); }
+  log(message, level = "") { this.emit("log", { message, level }); }
+  setStatus(text, ok = false) { this.emit("status", { text, ok }); }
+  setVoiceState(text) { this.emit("voiceState", { text }); }
+  setMode(mode) { this.state.mode = mode; this.emit("mode", { mode }); }
   emitMetrics() {
-    const durationSeconds = this.state.startedAt
-      ? (performance.now() - this.state.startedAt) / 1000
-      : 0;
-    this.emit("metrics", {
-      chunks: this.state.chunks,
-      prefillOk: this.state.prefillOk,
-      durationSeconds,
-    });
+    const durationSeconds = this.state.startedAt ? (performance.now() - this.state.startedAt) / 1000 : 0;
+    this.emit("metrics", { chunks: this.state.chunks, prefillOk: this.state.prefillOk, durationSeconds });
   }
 
   async loadServerConfig() {
@@ -125,28 +120,190 @@ export class RealtimeAudioClient extends EventTarget {
     if (!response.ok) throw new Error(`health check failed: ${response.status}`);
     const config = await response.json();
     this.emit("config", { config });
-    this.log(
-      `config model=${config.model} provider=${config.provider} prefill=${config.prefill_mode}`,
-    );
+    this.log(`config model=${config.model} provider=${config.provider} prefill=${config.prefill_mode}`);
     return config;
   }
 
   async handleAction() {
-    if (this.state.mode === "idle") {
-      await this.startRecording();
-    } else if (this.state.mode === "recording") {
-      await this.stopRecording();
-    } else if (this.state.mode === "finalizing" || this.state.mode === "speaking") {
-      await this.interruptAndRecord();
+    if (this.state.mode === "idle") { await this.startRecording(); }
+    else if (this.state.mode === "recording") { await this.stopRecording(); }
+    else if (this.state.mode === "finalizing" || this.state.mode === "speaking") { await this.interruptAndRecord(); }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  //  Persistent mic — always on, feeds ring buffer + VAD
+  // ═══════════════════════════════════════════════════════════
+
+  async _ensurePersistentMic() {
+    if (this.state._persistentMic) return;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    const audioContext = new AudioContext({ latencyHint: "interactive" });
+    await audioContext.audioWorklet.addModule(this.options.recorderWorkletUrl);
+    const source = audioContext.createMediaStreamSource(stream);
+    const chunkMs = Number(this.options.getPrefillMs() || 600);
+    const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
+      processorOptions: { chunkMs, vadFrameMs: this.options.vadFrameMs },
+    });
+    const sink = audioContext.createGain();
+    sink.gain.value = 0;
+    source.connect(node);
+    node.connect(sink);
+    sink.connect(audioContext.destination);
+
+    const ringBuf = new AudioRingBuffer(120000);
+    this.state._ringBuffer = ringBuf;
+
+    node.port.onmessage = (event) => {
+      if (!event.data) return;
+      if (event.data.type === "level") { this.handleVadLevel(event.data); return; }
+      if (event.data.type === "flushed") { this.resolveFlush(); return; }
+      if (event.data.type !== "chunk") return;
+      // always feed ring buffer
+      ringBuf.push(event.data.pcm, audioContext.sampleRate, chunkMs);
+      // feed persistent VAD WS
+      if (this.state._persistentVadWs && this.state._persistentVadWs.readyState === WebSocket.OPEN) {
+        this.state._persistentVadWs.send(event.data.pcm);
+      }
+      // feed audio WS if actively sending
+      if (this.state._sendingAudio && this.state.ws && this.state.ws.readyState === WebSocket.OPEN) {
+        this.state.ws.send(event.data.pcm);
+        this.state.chunks += 1;
+        this.emitMetrics();
+      }
+    };
+
+    this.state._persistentMic = { stream, audioContext, source, node, sink };
+    this.state._persistentMicSampleRate = audioContext.sampleRate;
+
+    // open persistent VAD WS
+    const vadConfig = this.options.getVadConfig() || {
+      engine: "silero", threshold: 0.8, minSpeechMs: 128, minSilenceMs: 800, maxSpeechMs: 30000, speechPadMs: 30,
+    };
+    const vadWs = new WebSocket(this.options.getVadMonitorWebSocketUrl());
+    this.state._persistentVadWs = vadWs;
+    vadWs.binaryType = "arraybuffer";
+    vadWs.onmessage = (event) => this._onPersistentVadEvent(event, vadWs);
+    vadWs.onerror = () => this.log("persistent VAD WS error", "error");
+    await new Promise((resolve, reject) => {
+      vadWs.onopen = resolve;
+      vadWs.onclose = () => reject(new Error("persistent VAD WS closed"));
+    });
+    vadWs.send(JSON.stringify({ type: "start", sampleRate: audioContext.sampleRate, vad: vadConfig }));
+    this.log(`persistent mic+VAD started, sampleRate=${audioContext.sampleRate}`);
+  }
+
+  _stopPersistentMic() {
+    if (this.state._persistentVadWs) {
+      try { this.state._persistentVadWs.close(); } catch (_) {}
+      this.state._persistentVadWs = null;
+    }
+    const m = this.state._persistentMic;
+    if (m) {
+      m.node.disconnect(); m.source.disconnect(); m.sink.disconnect();
+      m.stream.getTracks().forEach((t) => t.stop());
+      m.audioContext.close().catch(() => {});
+      this.state._persistentMic = null;
+      this.state._persistentMicSampleRate = null;
+    }
+    if (this.state._ringBuffer) { this.state._ringBuffer.clear(); this.state._ringBuffer = null; }
+  }
+
+  _drainRingBuffer() {
+    const buf = this.state._ringBuffer;
+    if (!buf || !buf.getChunks().length) return;
+    this.state.preBufferChunks = buf.getChunks();
+    this.state.preBufferSampleRate = buf.getSampleRate();
+    this.log(`drain buffer: ${buf.getChunks().length} chunks, ~${Math.round(buf.getTotalDurationMs())}ms`);
+    buf.clear();
+  }
+
+  // ═══════════════  Persistent VAD events  ═══════════════
+
+  _onPersistentVadEvent(event, socket) {
+    if (this.state._persistentVadWs !== socket) return;
+    const data = JSON.parse(event.data);
+    switch (data.type) {
+      case "ready":
+      case "vad_ready":
+      case "vad_monitor_started":
+        this.log(`persistent VAD ${data.type}`);
+        break;
+      case "vad_speech_start":
+        if (this.state.audioPlaying) {
+          // AI is speaking → barge-in
+          const cooldown = Number(this.options.bargeInCooldownMs || 800);
+          if (performance.now() - (this.state.startedAt || 0) < cooldown) {
+            this.log("barge-in ignored during cooldown"); return;
+          }
+          this.emit("bargeIn", { probability: data.probability, timeMs: data.time_ms });
+          this._doBargeIn().catch((err) => {
+            this.log(`barge-in failed: ${err.message || err}`, "error");
+            this.setMode("idle");
+          });
+        } else if (this.state.mode === "idle") {
+          // AI finished, user started speaking
+          this._doIdleStart().catch((err) => {
+            this.log(`idle start failed: ${err.message || err}`, "error");
+            this.setMode("idle");
+          });
+        }
+        break;
+      case "vad_speech_end":
+        this.setVoiceState("检测到说完，正在推理");
+        this.emit("vad", { event: data.event || "speech_end", speaking: false, probability: data.probability });
+        if (this.options.shouldAutoStopOnVad() && this.state.mode === "recording") {
+          this.stopRecording().catch((err) => {
+            this.log(`vad stop error: ${err.message || err}`, "error");
+            this.setMode("idle");
+          });
+        }
+        break;
+      case "vad_error":
+      case "error":
+        this.log(`persistent VAD error: ${data.message || data.type}`, "error");
+        break;
     }
   }
+
+  async _doBargeIn() {
+    if (!this.options.enableBargeIn || this.state.bargeInTriggered) return;
+    this.state.bargeInTriggered = true;
+    this.state.interrupted = true;
+    if (this.state.playedAssistantText.trim()) {
+      this.state.interruptedAssistantText = this.state.playedAssistantText.trim();
+    }
+    this._drainRingBuffer();
+    this.stopPlayback();
+    this.closeWs();
+    this.setMode("busy");
+    this.setStatus("检测到插话，开始录音", true);
+    this.setVoiceState("正在听你说");
+    await this.startRecording();
+  }
+
+  async _doIdleStart() {
+    this._drainRingBuffer();
+    this.setMode("busy");
+    this.setStatus("检测到说话", true);
+    this.setVoiceState("正在听你说");
+    await this.startRecording();
+  }
+
+  // ═══════════════  Recording (WS-based, uses persistent mic)  ═══════════════
 
   async startRecording() {
     this.setMode("busy");
     this.emit("result", { text: "录音中。", replace: true });
     this.setVoiceState("倾听中");
-    this.stopPlayback();
     this.emit("clearLog");
+
+    // Ensure persistent mic is running (first call initializes it)
+    await this._ensurePersistentMic();
+
+    // Drain ring buffer (captured during AI playback / gap)
+    this._drainRingBuffer();
 
     this.state.chunks = 0;
     this.state.prefillOk = 0;
@@ -173,83 +330,94 @@ export class RealtimeAudioClient extends EventTarget {
       socket.onclose = () => reject(new Error("WebSocket closed before start"));
     });
 
-    this.state.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-
+    const sr = this.state._persistentMicSampleRate || 48000;
     const chunkMs = Number(this.options.getPrefillMs() || 600);
-    this.state.audioContext = new AudioContext({ latencyHint: "interactive" });
-    await this.state.audioContext.audioWorklet.addModule(this.options.recorderWorkletUrl);
-    this.state.source = this.state.audioContext.createMediaStreamSource(this.state.stream);
-    this.state.node = new AudioWorkletNode(this.state.audioContext, "pcm-chunker", {
-      processorOptions: { chunkMs, vadFrameMs: this.options.vadFrameMs },
-    });
-    this.state.sink = this.state.audioContext.createGain();
-    this.state.sink.gain.value = 0;
-
-    this.state.node.port.onmessage = (event) => {
-      if (!event.data) return;
-      if (event.data.type === "level") {
-        this.handleVadLevel(event.data);
-        return;
-      }
-      if (event.data.type === "flushed") {
-        this.resolveFlush();
-        return;
-      }
-      if (event.data.type !== "chunk") return;
-      if (!this.state.ws || this.state.ws !== socket || this.state.ws.readyState !== WebSocket.OPEN) return;
-      socket.send(event.data.pcm);
-      this.state.chunks += 1;
-      this.emitMetrics();
-    };
-
-    this.state.source.connect(this.state.node);
-    this.state.node.connect(this.state.sink);
-    this.state.sink.connect(this.state.audioContext.destination);
-
     const interruptedText = this.state.interruptedAssistantText;
     this.state.interruptedAssistantText = "";
 
-    socket.send(
-      JSON.stringify({
-        type: "start",
-        sampleRate: this.state.audioContext.sampleRate,
-        prefillMs: chunkMs,
-        model: this.options.getModel().trim(),
-        prompt: this.options.getPrompt().trim(),
-        routeContext: this.options.getRouteContext(),
-        session_id: this.options.getSessionId(),
-        skillNames: this.options.getSkillNames(),
-        outputAudio: Boolean(this.options.getOutputAudio()),
-        streamSpeechAudio: Boolean(this.options.getStreamSpeechAudio()),
-        vad: this.options.getVadConfig(),
-        interrupted_assistant_text: interruptedText || "",
-      }),
-    );
+    socket.send(JSON.stringify({
+      type: "start",
+      sampleRate: sr,
+      prefillMs: chunkMs,
+      model: this.options.getModel().trim(),
+      prompt: this.options.getPrompt().trim(),
+      routeContext: this.options.getRouteContext(),
+      session_id: this.options.getSessionId(),
+      skillNames: this.options.getSkillNames(),
+      outputAudio: Boolean(this.options.getOutputAudio()),
+      streamSpeechAudio: Boolean(this.options.getStreamSpeechAudio()),
+      vad: this.options.getVadConfig(),
+      interrupted_assistant_text: interruptedText || "",
+    }));
 
+    // Send pre-buffer chunks first
+    const preChunks = this.state.preBufferChunks;
+    const preRate = this.state.preBufferSampleRate;
+    this.state.preBufferChunks = null;
+    this.state.preBufferSampleRate = null;
+    if (preChunks && preChunks.length) {
+      for (let i = 0; i < preChunks.length; i += 1) { socket.send(preChunks[i]); }
+      this.state.chunks += preChunks.length;
+      this.log(`sent ${preChunks.length} pre-buffer chunks (${preRate || "?"}Hz)`);
+    }
+
+    this.state._sendingAudio = true;
     this.state.startedAt = performance.now();
     this.state.timer = setInterval(() => this.emitMetrics(), 100);
     this.setStatus("录音中", true);
     this.setMode("recording");
-    this.log(`mic sampleRate=${this.state.audioContext.sampleRate}, chunkMs=${chunkMs}`);
+    this.log(`recording started, sampleRate=${sr}`);
     if (this.options.autoVad) {
       this.setVoiceState("等待说话");
       this.emit("vad", { event: "waiting", speaking: false, rms: 0 });
     }
   }
 
+  async stopRecording() {
+    if (this.state.mode !== "recording") return;
+    this.setMode("finalizing");
+    this.setStatus("停止录音，等待最终推理");
+    this.setVoiceState("模型输出中");
+    await this.flushInput();
+    this.state._sendingAudio = false;
+    if (this.state.ws && this.state.ws.readyState === WebSocket.OPEN) {
+      this.state.ws.send(JSON.stringify({ type: "stop" }));
+    }
+    if (this.state.timer) clearInterval(this.state.timer);
+    this.state.timer = null;
+  }
+
+  async interruptAndRecord() {
+    if (this.state.mode !== "finalizing" && this.state.mode !== "speaking") return;
+    this.state.interrupted = true;
+    if (this.state.playedAssistantText.trim()) {
+      this.state.interruptedAssistantText = this.state.playedAssistantText.trim();
+    }
+    this._drainRingBuffer();
+    this.stopPlayback();
+    this.closeWs();
+    this.setMode("busy");
+    this.setStatus("已打断，准备录音", true);
+    this.setVoiceState("倾听中");
+    await this.startRecording();
+  }
+
+  async bargeInAndRecord() { return this._doBargeIn(); }
+
+  async startPassiveCapture() {
+    await this._ensurePersistentMic();
+  }
+
+  stopBargeInMonitor() {
+    this._stopPersistentMic();
+  }
+
+  // ═══════════════  Audio playback  ═══════════════
+
   async unlockAudioOutput() {
     if (!this.options.useWebAudioPlayback) return;
     const context = this.ensurePlaybackContext();
-    if (context.state === "suspended") {
-      await context.resume();
-    }
+    if (context.state === "suspended") await context.resume();
     const source = context.createBufferSource();
     source.buffer = context.createBuffer(1, 1, context.sampleRate);
     source.connect(context.destination);
@@ -265,198 +433,154 @@ export class RealtimeAudioClient extends EventTarget {
     return this.state.playbackContext;
   }
 
-  async startBargeInMonitor() {
-    if (!this.options.enableBargeIn || this.state.bargeInWs || this.state.bargeInStarting) return;
-    if (!this.state.audioPlaying) return;
+  stopPlayback() {
+    this.state.playbackGeneration += 1;
+    if (this.state.currentAudio) {
+      this.state.currentAudio.onended = null;
+      this.state.currentAudio.onerror = null;
+      if (typeof this.state.currentAudio.pause === "function") {
+        this.state.currentAudio.pause();
+      } else if (typeof this.state.currentAudio.stop === "function") {
+        try { this.state.currentAudio.stop(); } catch (_err) { /* already stopped */ }
+      }
+      this.state.currentAudio = null;
+    }
+    this.state.audioQueue = [];
+    this.state.audioPlaying = false;
+  }
 
-    this.state.bargeInStarting = true;
-    const generation = this.state.playbackGeneration;
-    let socket = null;
-    try {
-      socket = new WebSocket(this.options.getVadMonitorWebSocketUrl());
-      this.state.bargeInWs = socket;
-      socket.binaryType = "arraybuffer";
-      socket.onmessage = (event) => this.onBargeInEvent(event, socket, generation);
-      socket.onerror = () => this.log("barge-in VAD WebSocket 错误", "error");
-      await new Promise((resolve, reject) => {
-        socket.onopen = resolve;
-        socket.onclose = () => reject(new Error("barge-in VAD WebSocket closed before start"));
+  enqueueAudio(audioDataUrl, audioIndex, historyText = "") {
+    if (!audioDataUrl) return;
+    const index = Number(audioIndex || this.state.streamedAudioCount || 1);
+    this.state.audioTextByIndex.set(index, historyText || this.getDisplayedText());
+    this.state.audioQueue.push({ url: audioDataUrl, index });
+    if (!this.state.audioPlaying) this.playNextAudio();
+  }
+
+  async playStandaloneAudio(audioDataUrl, historyText = "") {
+    if (!audioDataUrl) return;
+    await this.startPassiveCapture();
+    this.state.finalReceived = true;
+    this.state.interrupted = false;
+    this.state.playedAssistantText = historyText || this.getDisplayedText();
+    this.enqueueAudio(audioDataUrl, this.state.streamedAudioCount + 1, historyText || this.getDisplayedText());
+    if (this.hasPendingPlayback()) this.setMode("speaking");
+  }
+
+  playNextAudio() {
+    const next = this.state.audioQueue.shift();
+    if (!next) {
+      // Keep persistent mic+VAD alive for next turn detection
+      this.state.audioPlaying = false;
+      this.state.currentAudio = null;
+      if (this.state.finalReceived && !this.state.interrupted) {
+        this.setMode("idle");
+      }
+      this.setVoiceState("播报完");
+      return;
+    }
+    this.state.audioPlaying = true;
+    this.setVoiceState("正在播报中");
+    if (this.options.useWebAudioPlayback) {
+      const generation = this.state.playbackGeneration;
+      this.playNextAudioWithWebAudio(next, generation).catch((err) => {
+        this.log(`web audio play error: ${err.message || err}`, "error");
+        if (generation === this.state.playbackGeneration) this.playNextAudioWithElement(next);
       });
-
-      if (generation !== this.state.playbackGeneration || !this.state.audioPlaying) {
-        this.stopBargeInMonitor();
-        return;
-      }
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      this.state.bargeInStream = stream;
-      const audioContext = new AudioContext({ latencyHint: "interactive" });
-      this.state.bargeInAudioContext = audioContext;
-      await audioContext.audioWorklet.addModule(this.options.recorderWorkletUrl);
-      const source = audioContext.createMediaStreamSource(stream);
-      const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
-        processorOptions: {
-          chunkMs: Number(this.options.bargeInChunkMs || 120),
-          vadFrameMs: this.options.vadFrameMs,
-        },
-      });
-      const sink = audioContext.createGain();
-      sink.gain.value = 0;
-
-      if (generation !== this.state.playbackGeneration || !this.state.audioPlaying) {
-        this.stopBargeInMonitor();
-        return;
-      }
-
-      this.state.bargeInSource = source;
-      this.state.bargeInNode = node;
-      this.state.bargeInSink = sink;
-      this.state.bargeInStartedAt = performance.now();
-
-      node.port.onmessage = (event) => {
-        if (!event.data || event.data.type !== "chunk") return;
-        if (this.state.bargeInWs !== socket || socket.readyState !== WebSocket.OPEN) return;
-        socket.send(event.data.pcm);
-      };
-
-      source.connect(node);
-      node.connect(sink);
-      sink.connect(audioContext.destination);
-
-      const vad = this.options.getBargeInVadConfig() || this.options.getVadConfig();
-      socket.send(
-        JSON.stringify({
-          type: "start",
-          sampleRate: audioContext.sampleRate,
-          vad,
-        }),
-      );
-      this.log("barge-in VAD monitor started");
-    } catch (err) {
-      this.log(`barge-in monitor start failed: ${err.message || err}`, "error");
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.close();
-      }
-      this.stopBargeInMonitor();
-    } finally {
-      this.state.bargeInStarting = false;
+      return;
     }
+    this.playNextAudioWithElement(next);
   }
 
-  stopBargeInMonitor() {
-    if (this.state.bargeInNode) this.state.bargeInNode.disconnect();
-    if (this.state.bargeInSource) this.state.bargeInSource.disconnect();
-    if (this.state.bargeInSink) this.state.bargeInSink.disconnect();
-    if (this.state.bargeInStream) {
-      this.state.bargeInStream.getTracks().forEach((track) => track.stop());
-    }
-    if (this.state.bargeInAudioContext) {
-      this.state.bargeInAudioContext.close().catch(() => {});
-    }
-    if (this.state.bargeInWs && this.state.bargeInWs.readyState < WebSocket.CLOSING) {
-      try {
-        if (this.state.bargeInWs.readyState === WebSocket.OPEN) {
-          this.state.bargeInWs.send(JSON.stringify({ type: "stop" }));
-        }
-        this.state.bargeInWs.close();
-      } catch (_err) {
-        // Ignore close races while tearing down barge-in monitoring.
+  async playNextAudioWithWebAudio(next, generation) {
+    const context = this.ensurePlaybackContext();
+    if (context.state === "suspended") await context.resume();
+    const arrayBuffer = await this.audioDataUrlToArrayBuffer(next.url);
+    const audioBuffer = await context.decodeAudioData(arrayBuffer);
+    if (generation !== this.state.playbackGeneration || !this.state.audioPlaying) return;
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(context.destination);
+    this.state.currentAudio = source;
+    source.onended = () => {
+      if (this.state.currentAudio === source) this.state.currentAudio = null;
+      this.state.playedAssistantText =
+        this.state.audioTextByIndex.get(next.index) || this.state.playedAssistantText || this.getDisplayedText();
+      this.playNextAudio();
+    };
+    source.start();
+  }
+
+  playNextAudioWithElement(next) {
+    const player = new Audio(next.url);
+    this.state.currentAudio = player;
+    player.onended = () => {
+      if (this.state.currentAudio === player) this.state.currentAudio = null;
+      this.state.playedAssistantText =
+        this.state.audioTextByIndex.get(next.index) || this.state.playedAssistantText || this.getDisplayedText();
+      this.playNextAudio();
+    };
+    player.onerror = () => {
+      this.log("audio chunk decode/play error, skip to next", "error");
+      if (this.state.currentAudio === player) this.state.currentAudio = null;
+      this.playNextAudio();
+    };
+    player.play().catch((err) => {
+      this.log(`audio play blocked: ${err.message || err}`, "error");
+      if (this.state.currentAudio === player) this.state.currentAudio = null;
+      setTimeout(() => this.playNextAudio(), 0);
+    });
+  }
+
+  getDisplayedText() {
+    return this.options.getDisplayedText ? this.options.getDisplayedText() : "";
+  }
+
+  async audioDataUrlToArrayBuffer(dataUrl) {
+    const commaIndex = dataUrl.indexOf(",");
+    if (dataUrl.startsWith("data:") && commaIndex >= 0) {
+      const header = dataUrl.slice(0, commaIndex);
+      const body = dataUrl.slice(commaIndex + 1);
+      if (header.includes(";base64")) {
+        const binary = atob(body);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes.buffer;
       }
+      return new TextEncoder().encode(decodeURIComponent(body)).buffer;
     }
-    this.state.bargeInWs = null;
-    this.state.bargeInStream = null;
-    this.state.bargeInAudioContext = null;
-    this.state.bargeInSource = null;
-    this.state.bargeInNode = null;
-    this.state.bargeInSink = null;
-    this.state.bargeInStartedAt = 0;
-    this.state.bargeInStarting = false;
+    const response = await fetch(dataUrl);
+    if (!response.ok) throw new Error(`audio fetch failed: ${response.status}`);
+    return response.arrayBuffer();
   }
 
-  onBargeInEvent(event, socket, generation) {
-    if (this.state.bargeInWs !== socket || generation !== this.state.playbackGeneration) return;
-    const data = JSON.parse(event.data);
-    switch (data.type) {
-      case "ready":
-      case "vad_ready":
-      case "vad_monitor_started":
-        this.log(`barge-in ${data.type}`);
-        break;
-      case "vad_speech_start":
-        if (performance.now() - this.state.bargeInStartedAt < Number(this.options.bargeInCooldownMs || 800)) {
-          this.log("barge-in ignored during cooldown");
-          return;
-        }
-        this.emit("bargeIn", { probability: data.probability, timeMs: data.time_ms });
-        this.bargeInAndRecord().catch((err) => {
-          this.log(`barge-in interrupt failed: ${err.message || err}`, "error");
-          this.setMode("idle");
-        });
-        break;
-      case "vad_error":
-      case "error":
-        this.log(`barge-in VAD error: ${data.message || data.type}`, "error");
-        this.stopBargeInMonitor();
-        break;
-      default:
-        break;
-    }
+  hasPendingPlayback() { return this.state.audioPlaying || this.state.audioQueue.length > 0; }
+
+  // ═══════════════  Helpers  ═══════════════
+
+  closeWs() { if (this.state.ws && this.state.ws.readyState < WebSocket.CLOSING) { this.state.ws.close(); } }
+  closeSocket(socket) {
+    if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+    if (this.state.ws === socket) this.state.ws = null;
   }
 
-  async bargeInAndRecord() {
-    if (!this.options.enableBargeIn || this.state.bargeInTriggered) return;
-    if (!this.state.audioPlaying && this.state.mode !== "speaking" && this.state.mode !== "finalizing") return;
-
-    this.state.bargeInTriggered = true;
-    this.state.interrupted = true;
-    const historyText = this.state.playedAssistantText.trim();
-    if (historyText) {
-      this.state.interruptedAssistantText = historyText;
-    }
-    this.stopBargeInMonitor();
-    this.stopPlayback();
-    this.closeWs();
-    this.setMode("busy");
-    this.setStatus("检测到插话，开始录音", true);
-    this.setVoiceState("正在听你说");
-    this.log(`barge-in detected, saved_played_text=${historyText ? "yes" : "no"}`);
-    await this.startRecording();
-  }
-
-  async stopRecording() {
-    if (this.state.mode !== "recording") return;
-    this.setMode("finalizing");
-    this.setStatus("停止录音，等待最终推理");
-    this.setVoiceState("模型输出中");
-    await this.flushInput();
-    this.stopInputDevices();
+  stopInputDevices() {
+    this.state._sendingAudio = false;
     if (this.state.ws && this.state.ws.readyState === WebSocket.OPEN) {
       this.state.ws.send(JSON.stringify({ type: "stop" }));
     }
+    if (this.state.timer) clearInterval(this.state.timer);
+    this.state.ws = null;
+    this.state.timer = null;
   }
 
   async flushInput() {
-    if (!this.state.node) return;
+    if (!this.state._persistentMic || !this.state._persistentMic.node) return;
     await new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        if (this.state.flushResolve === done) {
-          this.state.flushResolve = null;
-        }
-        resolve();
-      }, 250);
-      const done = () => {
-        clearTimeout(timer);
-        resolve();
-      };
+      const timer = setTimeout(() => { if (this.state.flushResolve === done) this.state.flushResolve = null; resolve(); }, 250);
+      const done = () => { clearTimeout(timer); resolve(); };
       this.state.flushResolve = done;
-      this.state.node.port.postMessage({ type: "flush" });
+      this.state._persistentMic.node.port.postMessage({ type: "flush" });
     });
   }
 
@@ -470,12 +594,10 @@ export class RealtimeAudioClient extends EventTarget {
   handleVadLevel(data) {
     const vad = this.state.vad;
     if (!vad.enabled || this.state.mode !== "recording" || vad.autoStopping) return;
-
     const durationMs = Number(data.durationMs || this.options.vadFrameMs || 50);
     const rms = Number(data.rms || 0);
     const speaking = rms >= Number(this.options.vadThreshold || 0.018);
     vad.latestRms = rms;
-
     if (speaking) {
       vad.speechMs += durationMs;
       vad.totalSpeechMs += durationMs;
@@ -490,13 +612,8 @@ export class RealtimeAudioClient extends EventTarget {
       }
       return;
     }
-
     vad.speechMs = 0;
-    if (!vad.speechStarted) {
-      this.emit("vad", { event: "silence", speaking: false, rms });
-      return;
-    }
-
+    if (!vad.speechStarted) { this.emit("vad", { event: "silence", speaking: false, rms }); return; }
     vad.silenceMs += durationMs;
     this.emit("vad", { event: "speech_silence", speaking: false, rms, silenceMs: vad.silenceMs });
     if (vad.silenceMs >= Number(this.options.vadMinSilenceMs || 850)) {
@@ -516,119 +633,47 @@ export class RealtimeAudioClient extends EventTarget {
     });
   }
 
-  stopInputDevices() {
-    if (this.state.node) this.state.node.disconnect();
-    if (this.state.source) this.state.source.disconnect();
-    if (this.state.sink) this.state.sink.disconnect();
-    if (this.state.stream) this.state.stream.getTracks().forEach((track) => track.stop());
-    if (this.state.audioContext) this.state.audioContext.close().catch(() => {});
-    if (this.state.timer) clearInterval(this.state.timer);
-    this.state.node = null;
-    this.state.source = null;
-    this.state.sink = null;
-    this.state.stream = null;
-    this.state.audioContext = null;
-    this.state.timer = null;
-  }
+  // ═══════════════  Server events (ws/audio)  ═══════════════
 
   onServerEvent(event, socket) {
     if (socket !== this.state.ws) return;
     const data = JSON.parse(event.data);
     switch (data.type) {
-      case "ready":
-        this.log(`session=${data.session_id}`);
-        break;
+      case "ready": this.log(`session=${data.session_id}`); break;
       case "started":
-        this.log(
-          `server started model=${data.model} api=${data.qwen_api_base} history=${data.history_messages || 0}`,
-        );
-        if (Array.isArray(data.skills) && data.skills.length) {
-          this.log(`skills ${data.skills.join(", ")}`);
-        }
-        if (Array.isArray(data.missing_skills) && data.missing_skills.length) {
-          this.log(`missing skills ${data.missing_skills.join(", ")}`, "error");
-        }
+        this.log(`server started model=${data.model} api=${data.qwen_api_base} history=${data.history_messages || 0}`);
+        if (Array.isArray(data.skills) && data.skills.length) this.log(`skills ${data.skills.join(", ")}`);
+        if (Array.isArray(data.missing_skills) && data.missing_skills.length) this.log(`missing skills ${data.missing_skills.join(", ")}`, "error");
         break;
-      case "chunk_received":
-        this.log(`chunk ${data.chunk_index} received, duration=${data.duration_ms}ms`);
-        break;
-      case "prefill_ok":
-        this.state.prefillOk += 1;
-        this.emitMetrics();
-        this.log(`prefill ${data.chunk_index} ok, latency=${data.latency_ms}ms`);
-        break;
-      case "prefill_error":
-        this.log(`prefill ${data.chunk_index || ""} error: ${data.message || data.status_code}`, "error");
-        break;
-      case "vad_ready":
-        this.setVoiceState("等待说话");
-        this.emit("vad", { event: "ready", engine: data.engine, threshold: data.threshold });
-        this.log(
-          `vad ready engine=${data.engine} threshold=${data.threshold} silence=${data.min_silence_ms}ms`,
-        );
-        break;
-      case "vad_speech_start":
-        this.setVoiceState("正在听你说");
-        this.emit("vad", { event: "speech_start", speaking: true, probability: data.probability });
-        break;
+      case "chunk_received": this.log(`chunk ${data.chunk_index} received, duration=${data.duration_ms}ms`); break;
+      case "prefill_ok": this.state.prefillOk += 1; this.emitMetrics(); this.log(`prefill ${data.chunk_index} ok, latency=${data.latency_ms}ms`); break;
+      case "prefill_error": this.log(`prefill ${data.chunk_index || ""} error: ${data.message || data.status_code}`, "error"); break;
+      case "vad_ready": this.setVoiceState("等待说话"); this.emit("vad", { event: "ready", engine: data.engine, threshold: data.threshold }); break;
+      case "vad_speech_start": this.setVoiceState("正在听你说"); this.emit("vad", { event: "speech_start", speaking: true, probability: data.probability }); break;
       case "vad_speech_end":
         this.setVoiceState("检测到说完，正在推理");
         this.emit("vad", { event: data.event || "speech_end", speaking: false, probability: data.probability });
         if (!this.options.shouldAutoStopOnVad()) break;
-        this.stopRecording().catch((err) => {
-          this.log(`server vad stop error: ${err.message || err}`, "error");
-          this.setMode("idle");
-        });
+        this.stopRecording().catch((err) => { this.log(`server vad stop error: ${err.message || err}`, "error"); this.setMode("idle"); });
         break;
-      case "vad_error":
-        this.log(`vad error: ${data.message}`, "error");
-        this.setVoiceState("VAD 不可用");
-        this.emit("vad", { event: "error", message: data.message });
-        break;
-      case "finalizing":
-        this.log(`finalizing ${data.chunks} chunks`);
-        this.emit("result", { text: "模型输出中。", replace: true });
-        this.setVoiceState("模型输出中");
-        break;
+      case "vad_error": this.log(`vad error: ${data.message}`, "error"); this.emit("vad", { event: "error", message: data.message }); break;
+      case "finalizing": this.log(`finalizing ${data.chunks} chunks`); this.emit("result", { text: "模型输出中。", replace: true }); this.setVoiceState("模型输出中"); break;
       case "final_text_delta":
-        if (!this.state.streamingTextStarted) {
-          this.emit("result", { text: "", replace: true });
-          this.state.streamingTextStarted = true;
-        }
-        this.emit("result", { text: data.text || "", append: true });
-        break;
+        if (!this.state.streamingTextStarted) { this.emit("result", { text: "", replace: true }); this.state.streamingTextStarted = true; }
+        this.emit("result", { text: data.text || "", append: true }); break;
       case "final_audio_delta":
         this.state.streamedAudioCount += 1;
-        this.enqueueAudio(
-          data.audio_data_url,
-          data.audio_index || this.state.streamedAudioCount,
-          data.history_text || data.speech_text || "",
-        );
-        if (this.state.mode === "finalizing") {
-          this.setMode("speaking");
-        }
-        this.setVoiceState("正在播报中");
-        this.log(`audio chunk ${data.audio_index || this.state.streamedAudioCount} received`);
-        break;
-      case "component_call_started":
-        this.stopPlayback();
-        this.emit("result", { text: "正在查询开户网点...", replace: true, loading: true });
-        this.setVoiceState("正在查询开户网点");
-        this.log(`component call ${data.components || ""} started`);
-        break;
-      case "final_result":
-        this.handleFinalResult(data, socket);
-        break;
-      case "final_error":
-      case "error":
+        this.enqueueAudio(data.audio_data_url, data.audio_index || this.state.streamedAudioCount, data.history_text || data.speech_text || "");
+        if (this.state.mode === "finalizing") this.setMode("speaking");
+        this.setVoiceState("正在播报中"); break;
+      case "component_call_started": this.stopPlayback(); this.emit("result", { text: "正在查询开户网点...", replace: true, loading: true }); break;
+      case "final_result": this.handleFinalResult(data, socket); break;
+      case "final_error": case "error":
         this.emit("result", { text: data.message || "请求失败。", replace: true });
-        this.setVoiceState("倾听中");
-        this.setMode("idle");
+        this.setVoiceState("倾听中"); this.setMode("idle");
         this.log(`${data.type}: ${data.message || data.status_code}`, "error");
-        this.closeSocket(socket);
-        break;
-      default:
-        this.log(JSON.stringify(data));
+        this.closeSocket(socket); break;
+      default: this.log(JSON.stringify(data));
     }
   }
 
@@ -637,15 +682,9 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.finalReceived = true;
     this.state.finalUserText = typeof data.user_history_text === "string" ? data.user_history_text.trim() : "";
     const userDisplayText = typeof data.user_display_text === "string" ? data.user_display_text.trim() : "";
-    if (userDisplayText) {
-      this.emit("userTranscript", { text: userDisplayText });
-    }
+    if (userDisplayText) this.emit("userTranscript", { text: userDisplayText });
     if (data.new_session) {
-      this.emit("routedSession", {
-        selected_skills: data.selected_skills || [],
-        selected_skill: data.selected_skill || "",
-        user_text: userDisplayText || "语音输入已提交",
-      });
+      this.emit("routedSession", { selected_skills: data.selected_skills || [], selected_skill: data.selected_skill || "", user_text: userDisplayText || "语音输入已提交" });
     }
     const currentText = this.getDisplayedText();
     if (data.text) {
@@ -654,219 +693,25 @@ export class RealtimeAudioClient extends EventTarget {
       this.emit("result", { text: data.text, replace: true });
     } else if (!this.state.streamingTextStarted) {
       this.emit("result", { text: "服务端没有返回文本。", replace: true });
-      this.state.finalText = "";
-      this.state.finalHistoryText = "";
+      this.state.finalText = ""; this.state.finalHistoryText = "";
     } else {
       this.state.finalText = currentText;
       this.state.finalHistoryText = typeof data.history_text === "string" ? data.history_text : currentText;
     }
-
     if (data.audio_data_url) {
       this.enqueueAudio(data.audio_data_url, this.state.streamedAudioCount + 1, this.state.finalHistoryText);
     } else if (this.state.streamedAudioCount === 0) {
       this.setVoiceState("播报完");
-      this.log("没有解析到音频输出。确认模型服务启用了音频输出和 stream。");
+      this.log("没有解析到音频输出。");
     }
-
     if (this.hasPendingPlayback()) {
       this.setMode("speaking");
-      if (this.shouldStartBargeInMonitor()) {
-        this.startBargeInMonitor().catch((err) => {
-          this.log(`barge-in monitor error: ${err.message || err}`, "error");
-        });
-      }
     } else {
       this.setMode("idle");
     }
-    this.log(
-      `final latency=${data.latency_ms}ms, audio_chunks=${data.audio_chunks || this.state.streamedAudioCount}, input=${data.saved_input_wav}`,
-    );
+    this.log(`final latency=${data.latency_ms}ms, audio_chunks=${data.audio_chunks || this.state.streamedAudioCount}, input=${data.saved_input_wav}`);
     this.closeSocket(socket);
   }
-
-  getDisplayedText() {
-    return this.options.getDisplayedText ? this.options.getDisplayedText() : "";
-  }
-
-  closeWs() {
-    if (this.state.ws && this.state.ws.readyState < WebSocket.CLOSING) {
-      this.state.ws.close();
-    }
-  }
-
-  closeSocket(socket) {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.close();
-    }
-    if (this.state.ws === socket) {
-      this.state.ws = null;
-    }
-  }
-
-  hasPendingPlayback() {
-    return this.state.audioPlaying || this.state.audioQueue.length > 0;
-  }
-
-  shouldStartBargeInMonitor() {
-    if (!this.options.enableBargeIn) return false;
-    if (this.options.bargeInAfterFinalResultOnly && !this.state.finalReceived) return false;
-    return true;
-  }
-
-  async interruptAndRecord() {
-    if (this.state.mode !== "finalizing" && this.state.mode !== "speaking") return;
-    this.state.interrupted = true;
-    const historyText = this.state.playedAssistantText.trim();
-    if (historyText) {
-      this.state.interruptedAssistantText = historyText;
-    }
-    this.stopPlayback();
-    this.closeWs();
-    this.setMode("busy");
-    this.setStatus("已打断，准备录音", true);
-    this.setVoiceState("倾听中");
-    this.log(`interrupted, saved_played_text=${historyText ? "yes" : "no"}`);
-    await this.startRecording();
-  }
-
-  stopPlayback() {
-    this.stopBargeInMonitor();
-    this.state.playbackGeneration += 1;
-    if (this.state.currentAudio) {
-      this.state.currentAudio.onended = null;
-      this.state.currentAudio.onerror = null;
-      if (typeof this.state.currentAudio.pause === "function") {
-        this.state.currentAudio.pause();
-      } else if (typeof this.state.currentAudio.stop === "function") {
-        try {
-          this.state.currentAudio.stop();
-        } catch (_err) {
-          // Already stopped.
-        }
-      }
-      this.state.currentAudio = null;
-    }
-    this.state.audioQueue = [];
-    this.state.audioPlaying = false;
-  }
-
-  enqueueAudio(audioDataUrl, audioIndex, historyText = "") {
-    if (!audioDataUrl) return;
-    const index = Number(audioIndex || this.state.streamedAudioCount || 1);
-    this.state.audioTextByIndex.set(index, historyText || this.getDisplayedText());
-    this.state.audioQueue.push({ url: audioDataUrl, index });
-    if (!this.state.audioPlaying) {
-      this.playNextAudio();
-    }
-  }
-
-  playNextAudio() {
-    const next = this.state.audioQueue.shift();
-    if (!next) {
-      this.stopBargeInMonitor();
-      this.state.audioPlaying = false;
-      this.state.currentAudio = null;
-      if (this.state.finalReceived && !this.state.interrupted) {
-        this.setMode("idle");
-      }
-      this.setVoiceState("播报完");
-      return;
-    }
-    this.state.audioPlaying = true;
-    this.setVoiceState("正在播报中");
-    if (this.shouldStartBargeInMonitor()) {
-      this.startBargeInMonitor().catch((err) => {
-        this.log(`barge-in monitor error: ${err.message || err}`, "error");
-      });
-    }
-
-    if (this.options.useWebAudioPlayback) {
-      const generation = this.state.playbackGeneration;
-      this.playNextAudioWithWebAudio(next, generation).catch((err) => {
-        this.log(`web audio play error: ${err.message || err}`, "error");
-        if (generation === this.state.playbackGeneration) {
-          this.playNextAudioWithElement(next);
-        }
-      });
-      return;
-    }
-
-    this.playNextAudioWithElement(next);
-  }
-
-  async playNextAudioWithWebAudio(next, generation) {
-    const context = this.ensurePlaybackContext();
-    if (context.state === "suspended") {
-      await context.resume();
-    }
-    const arrayBuffer = await this.audioDataUrlToArrayBuffer(next.url);
-    const audioBuffer = await context.decodeAudioData(arrayBuffer);
-    if (generation !== this.state.playbackGeneration || !this.state.audioPlaying) return;
-
-    const source = context.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(context.destination);
-    this.state.currentAudio = source;
-    source.onended = () => {
-      if (this.state.currentAudio === source) {
-        this.state.currentAudio = null;
-      }
-      this.state.playedAssistantText =
-        this.state.audioTextByIndex.get(next.index) || this.state.playedAssistantText || this.getDisplayedText();
-      this.playNextAudio();
-    };
-    source.start();
-  }
-
-  playNextAudioWithElement(next) {
-    const player = new Audio(next.url);
-    this.state.currentAudio = player;
-    player.onended = () => {
-      if (this.state.currentAudio === player) {
-        this.state.currentAudio = null;
-      }
-      this.state.playedAssistantText =
-        this.state.audioTextByIndex.get(next.index) || this.state.playedAssistantText || this.getDisplayedText();
-      this.playNextAudio();
-    };
-    player.onerror = () => {
-      this.log("audio chunk decode/play error, skip to next", "error");
-      if (this.state.currentAudio === player) {
-        this.state.currentAudio = null;
-      }
-      this.playNextAudio();
-    };
-    player.play().catch((err) => {
-      this.log(`audio play blocked: ${err.message || err}`, "error");
-      if (this.state.currentAudio === player) {
-        this.state.currentAudio = null;
-      }
-      setTimeout(() => this.playNextAudio(), 0);
-    });
-  }
-
-  async audioDataUrlToArrayBuffer(dataUrl) {
-    const commaIndex = dataUrl.indexOf(",");
-    if (dataUrl.startsWith("data:") && commaIndex >= 0) {
-      const header = dataUrl.slice(0, commaIndex);
-      const body = dataUrl.slice(commaIndex + 1);
-      if (header.includes(";base64")) {
-        const binary = atob(body);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes.buffer;
-      }
-      return new TextEncoder().encode(decodeURIComponent(body)).buffer;
-    }
-    const response = await fetch(dataUrl);
-    if (!response.ok) throw new Error(`audio fetch failed: ${response.status}`);
-    return response.arrayBuffer();
-  }
-
-  // History is now managed on the backend via session_store.
-  // The frontend no longer maintains a local history array.
 }
 
 function defaultWebSocketUrl() {

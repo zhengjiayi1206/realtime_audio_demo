@@ -770,10 +770,11 @@
       /* ── RealtimeAudioClient ── */
       const client = new RealtimeAudioClient({
         useWebAudioPlayback: true,
-        enableBargeIn: false,
+        enableBargeIn: true,
         bargeInAfterFinalResultOnly: true,
         bargeInChunkMs: 120,
-        bargeInCooldownMs: 900,
+        bargeInCooldownMs: 400,
+        bargeInPreBufferMs: 120000,
         getModel: () => modelName,
         getPrompt: () => "",
         getSessionId: () => sessionId,
@@ -788,21 +789,14 @@
           autoConversation
             ? {
                 engine: "silero",
-                threshold: 0.5,
-                minSpeechMs: 180,
-                minSilenceMs: 450,
+                threshold: 0.8,
+                minSpeechMs: 128,
+                minSilenceMs: 800,
                 maxSpeechMs: 30000,
                 speechPadMs: 30,
               }
             : null,
-        getBargeInVadConfig: () => ({
-          engine: "silero",
-          threshold: 0.92,
-          minSpeechMs: 350,
-          minSilenceMs: 650,
-          maxSpeechMs: 6000,
-          speechPadMs: 30,
-        }),
+        getBargeInVadConfig() { return this.getVadConfig(); },
       });
 
       client.on("config", ({ config }) => {
@@ -1204,8 +1198,7 @@
         }
         if (data.audio_data_url) {
           stopTextAudio();
-          textAudio = new Audio(data.audio_data_url);
-          await textAudio.play().catch(() => {});
+          await client.playStandaloneAudio(data.audio_data_url, speechText);
         }
       }
 
@@ -1219,9 +1212,12 @@
       }
 
       function stopTextAudio() {
-        if (!textAudio) return;
-        textAudio.pause();
+        if (textAudio) textAudio.pause();
         textAudio = null;
+        client.stopPlayback();
+        if (client.state.mode === "speaking") {
+          client.setMode("idle");
+        }
       }
 
       async function startRealtimeConversation() {
