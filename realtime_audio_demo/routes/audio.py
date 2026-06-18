@@ -11,6 +11,10 @@ from fastapi.responses import JSONResponse
 from realtime_audio_demo.config import (
     CAPTURE_DIR,
     DEFAULT_PREFILL_MS,
+    EASYTURN_ACK_TEXT,
+    EASYTURN_CHECKPOINT,
+    EASYTURN_ENABLED,
+    EASYTURN_LLM_PATH,
     FINAL_MAX_TOKENS,
     PREFILL_MODE,
     QWEN_API_BASE,
@@ -110,13 +114,9 @@ async def chatbox_text(request: Request) -> JSONResponse:
                 await lock_session_skill(session_id, selected_skill)
             routed_skill_names = [selected_skill]
             prompt, used_skills, missing_skills = compose_realtime_prompt("", routed_skill_names)
-            routed_user_text = (
-                f"用户原始输入：{user_text}\n\n"
-                f"意图识别结果：{json.dumps(intent_json, ensure_ascii=False)}"
-            )
             routed_result, routed_status_code = await request_text_completion(
                 model=model,
-                text=routed_user_text,
+                text=user_text,
                 prompt=prompt,
                 history=[],
                 max_tokens=FINAL_MAX_TOKENS,
@@ -228,13 +228,9 @@ async def maybe_route_chatbox_voice_intent(
 
     routed_skill_names = [selected_skill]
     prompt, used_skills, missing_skills = compose_realtime_prompt("", routed_skill_names)
-    routed_user_text = (
-        f"用户语音输入的结构化意图：{user_history_text}\n\n"
-        f"意图识别结果：{json.dumps(intent_json, ensure_ascii=False)}"
-    )
     routed_result, routed_status_code = await request_text_completion(
         model=model,
-        text=routed_user_text,
+        text=user_history_text,
         prompt=prompt,
         history=[],
         max_tokens=FINAL_MAX_TOKENS,
@@ -302,10 +298,10 @@ def format_voice_user_history(intent_json: dict[str, Any]) -> str:
                 f"target.params1={target.get('params1') or ''}#"
                 f"target.params2={target.get('params2') or ''}"
             )
-    if content and intention:
-        return f"语音输入意图：{intention}；模型追问/确认：{content}"
+    if content:
+        return content
     if intention:
-        return f"语音输入意图：{intention}"
+        return f"用户语音输入：{intention}"
     if content:
         return f"语音输入内容：{content}"
     return "[用户通过语音输入了一条消息]"
@@ -401,6 +397,10 @@ async def handle_vad_control_message(session: AudioSession, text: str) -> None:
     elif event_type == "stop":
         session.stopped = True
         await send_event(session, "vad_monitor_stopped", {"session_id": session.session_id})
+    elif event_type == "reset_vad":
+        if session.vad is not None:
+            session.vad.reset()
+        await send_event(session, "vad_reset", {"session_id": session.session_id})
     elif event_type == "ping":
         await send_event(session, "pong", {"ts": time.time()})
     else:
@@ -471,8 +471,16 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
             },
         )
     elif event_type == "stop":
-        session.stopped = True
+        logger.info(
+            "audio stop received session=%s chunks=%d easyturn_enabled=%s",
+            session.session_id,
+            len(session.chunks),
+            EASYTURN_ENABLED,
+        )
         await send_event(session, "finalizing", {"chunks": len(session.chunks)})
+        if await maybe_handle_easy_turn_stop(session):
+            return
+        session.stopped = True
         await finalize_session(session)
     elif event_type == "ping":
         await send_event(session, "pong", {"ts": time.time()})
@@ -505,6 +513,75 @@ async def synthesize_speech_audio(model: str, text: str | None) -> str | None:
         return None
     audio_data_url = result.get("audio_data_url")
     return str(audio_data_url) if audio_data_url else None
+
+
+async def maybe_handle_easy_turn_stop(session: AudioSession) -> bool:
+    if not EASYTURN_ENABLED:
+        logger.info("easyturn skipped: EASYTURN_ENABLED=0 session=%s", session.session_id)
+        return False
+    if not session.chunks:
+        logger.info("easyturn skipped: no audio chunks session=%s", session.session_id)
+        return False
+
+    logger.info(
+        "easyturn judging session=%s chunks=%d source_sr=%d checkpoint_configured=%s llm_path_configured=%s",
+        session.session_id,
+        len(session.chunks),
+        session.source_sample_rate,
+        bool(EASYTURN_CHECKPOINT),
+        bool(EASYTURN_LLM_PATH),
+    )
+    try:
+        from easy_turn.service import judge_turn
+
+        decision = await asyncio.to_thread(judge_turn, list(session.chunks), session.source_sample_rate)
+    except Exception as exc:
+        logger.exception("EasyTurn judge failed; fallback to final inference: %s", exc)
+        await send_event(session, "turn_error", {"message": str(exc)})
+        return False
+
+    logger.info(
+        "easyturn state=%s latency=%dms audio=%.2fs raw=%r",
+        decision.turn_state,
+        decision.latency_ms,
+        decision.audio_seconds,
+        decision.raw_output,
+    )
+
+    if decision.turn_state != "INCOMPLETE":
+        logger.info("easyturn final route: state=%s -> qwen final inference", decision.turn_state)
+        await send_event(
+            session,
+            "turn_complete",
+            {
+                "turn_state": decision.turn_state,
+                "transcription": decision.transcription,
+                "latency_ms": decision.latency_ms,
+                "audio_seconds": decision.audio_seconds,
+            },
+        )
+        return False
+
+    audio_data_url = await synthesize_speech_audio(session.model, EASYTURN_ACK_TEXT) if session.output_audio else None
+    logger.info("easyturn incomplete route: ack_text=%r audio=%s", EASYTURN_ACK_TEXT, bool(audio_data_url))
+    session.chunks.clear()
+    if session.vad is not None:
+        session.vad.reset()
+    session.stopped = False
+    await send_event(
+        session,
+        "turn_incomplete",
+        {
+            "turn_state": decision.turn_state,
+            "transcription": decision.transcription,
+            "raw_output": decision.raw_output,
+            "latency_ms": decision.latency_ms,
+            "audio_seconds": decision.audio_seconds,
+            "text": EASYTURN_ACK_TEXT,
+            "audio_data_url": audio_data_url,
+        },
+    )
+    return True
 
 
 def should_buffer_component_candidate(text: str) -> bool:

@@ -69,6 +69,7 @@ export class RealtimeAudioClient extends EventTarget {
       finalText: "",
       finalHistoryText: "",
       finalUserText: "",
+      resumeAfterTurnAck: false,
       interruptedAssistantText: "",
       interrupted: false,
       streamedAudioCount: 0,
@@ -315,6 +316,7 @@ export class RealtimeAudioClient extends EventTarget {
     this.state.finalText = "";
     this.state.finalHistoryText = "";
     this.state.finalUserText = "";
+    this.state.resumeAfterTurnAck = false;
     this.state.interrupted = false;
     this.state.bargeInTriggered = false;
     this.state.vad = this.createVadState();
@@ -473,6 +475,10 @@ export class RealtimeAudioClient extends EventTarget {
       // Keep persistent mic+VAD alive for next turn detection
       this.state.audioPlaying = false;
       this.state.currentAudio = null;
+      if (this.state.resumeAfterTurnAck) {
+        this.resumeRecordingAfterTurnAck();
+        return;
+      }
       if (this.state.finalReceived && !this.state.interrupted) {
         this.setMode("idle");
       }
@@ -657,7 +663,10 @@ export class RealtimeAudioClient extends EventTarget {
         this.stopRecording().catch((err) => { this.log(`server vad stop error: ${err.message || err}`, "error"); this.setMode("idle"); });
         break;
       case "vad_error": this.log(`vad error: ${data.message}`, "error"); this.emit("vad", { event: "error", message: data.message }); break;
-      case "finalizing": this.log(`finalizing ${data.chunks} chunks`); this.emit("result", { text: "模型输出中。", replace: true }); this.setVoiceState("模型输出中"); break;
+      case "finalizing": this.log(`finalizing ${data.chunks} chunks`); this.emit("result", { text: "判断是否说完。", replace: true }); this.setVoiceState("判断是否说完"); break;
+      case "turn_incomplete": this.handleTurnIncomplete(data); break;
+      case "turn_complete": this.log(`easyturn ${data.turn_state} latency=${data.latency_ms}ms`); break;
+      case "turn_error": this.log(`easyturn error: ${data.message || ""}`, "error"); break;
       case "final_text_delta":
         if (!this.state.streamingTextStarted) { this.emit("result", { text: "", replace: true }); this.state.streamingTextStarted = true; }
         this.emit("result", { text: data.text || "", append: true }); break;
@@ -711,6 +720,64 @@ export class RealtimeAudioClient extends EventTarget {
     }
     this.log(`final latency=${data.latency_ms}ms, audio_chunks=${data.audio_chunks || this.state.streamedAudioCount}, input=${data.saved_input_wav}`);
     this.closeSocket(socket);
+  }
+
+  handleTurnIncomplete(data) {
+    this.log(`easyturn incomplete latency=${data.latency_ms}ms audio=${Number(data.audio_seconds || 0).toFixed(2)}s`);
+    const text = data.text || "嗯，我在听，你继续。";
+    this.emit("result", { text, replace: true });
+    this.setStatus("继续倾听", true);
+    this.setVoiceState("请继续说");
+    this.state.resumeAfterTurnAck = true;
+    if (data.audio_data_url) {
+      this.enqueueAudio(data.audio_data_url, this.state.streamedAudioCount + 1, text);
+      this.setMode("speaking");
+    } else {
+      this.resumeRecordingAfterTurnAck();
+    }
+  }
+
+  resumeRecordingAfterTurnAck() {
+    if (!this.state.ws || this.state.ws.readyState !== WebSocket.OPEN) {
+      this.setMode("idle");
+      return;
+    }
+    this.state.resumeAfterTurnAck = false;
+
+    // Reset persistent VAD so it can detect the next round of speech
+    if (this.state._persistentVadWs && this.state._persistentVadWs.readyState === WebSocket.OPEN) {
+      const vadConfig = this.options.getVadConfig() || {
+        engine: "silero", threshold: 0.8, minSpeechMs: 128, minSilenceMs: 800, maxSpeechMs: 30000, speechPadMs: 30,
+      };
+      this.state._persistentVadWs.send(JSON.stringify({
+        type: "reset_vad",
+        sampleRate: this.state._persistentMicSampleRate || 48000,
+        vad: vadConfig,
+      }));
+    }
+
+    // Drain ring buffer — user may have started speaking during ack playback
+    this._drainRingBuffer();
+    const preChunks = this.state.preBufferChunks;
+    this.state.preBufferChunks = null;
+    this.state.preBufferSampleRate = null;
+    if (preChunks && preChunks.length) {
+      for (let i = 0; i < preChunks.length; i += 1) {
+        this.state.ws.send(preChunks[i]);
+      }
+      this.state.chunks += preChunks.length;
+      this.log(`sent ${preChunks.length} pre-buffer chunks after turn-incomplete ack`);
+    }
+
+    this.state._sendingAudio = true;
+    this.state.vad = this.createVadState();
+    this.state.startedAt = performance.now();
+    if (!this.state.timer) {
+      this.state.timer = setInterval(() => this.emitMetrics(), 100);
+    }
+    this.setStatus("录音中", true);
+    this.setVoiceState("正在听你说");
+    this.setMode("recording");
   }
 }
 

@@ -31,6 +31,15 @@ SILERO_VAD_MIN_SPEECH_MS = int(os.getenv("SILERO_VAD_MIN_SPEECH_MS", "180"))
 SILERO_VAD_MIN_SILENCE_MS = int(os.getenv("SILERO_VAD_MIN_SILENCE_MS", "450"))
 SILERO_VAD_MAX_SPEECH_MS = int(os.getenv("SILERO_VAD_MAX_SPEECH_MS", "30000"))
 SILERO_VAD_SPEECH_PAD_MS = int(os.getenv("SILERO_VAD_SPEECH_PAD_MS", "30"))
+EASYTURN_ENABLED = os.getenv("EASYTURN_ENABLED", "1").lower() not in {"0", "false", "off", "no"}
+EASYTURN_PRELOAD = os.getenv("EASYTURN_PRELOAD", "1").lower() in {"1", "true", "on", "yes"}
+EASYTURN_CONFIG = os.getenv("EASYTURN_CONFIG", str(APP_DIR / "easy_turn" / "config.yaml"))
+EASYTURN_CHECKPOINT = os.getenv("EASYTURN_CHECKPOINT", "")
+EASYTURN_LLM_PATH = os.getenv("EASYTURN_LLM_PATH", "")
+EASYTURN_GPU = int(os.getenv("EASYTURN_GPU", "0"))
+EASYTURN_PROMPT = os.getenv("EASYTURN_PROMPT", "<TRANSCRIBE> <BACKCHANNEL> <COMPLETE>")
+EASYTURN_ACK_TEXT = os.getenv("EASYTURN_ACK_TEXT", "嗯，我在听，你继续。")
+EASYTURN_MAX_AUDIO_SECONDS = float(os.getenv("EASYTURN_MAX_AUDIO_SECONDS", "30"))
 REALTIME_DEFAULT_SKILLS = [
     item.strip() for item in os.getenv("REALTIME_DEFAULT_SKILLS", "intent-recognition").split(",") if item.strip()
 ]

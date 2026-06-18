@@ -1,0 +1,129 @@
+# Easy-Turn 模型配置 (基于 train.yaml)
+# 架构: Whisper encoder + adapter + Qwen2.5-0.5B LLM
+
+model: llmasr
+
+# LLM 路径 (Qwen2.5-0.5B, 从 HuggingFace 自动下载)
+llm_path: Qwen/Qwen2.5-0.5B-Instruct
+
+# Tokenizer
+tokenizer: huggingface
+tokenizer_conf:
+  llm_path: Qwen/Qwen2.5-0.5B-Instruct
+
+# LoRA (推理时关闭)
+use_lora: false
+lora_alpha: 32
+lora_rank: 8
+lora_dropout: 0.1
+
+# 语音 token 数
+speech_token_num: 4097
+
+# 训练时解冻的模块 (推理时不需要)
+fire_module: encoder_and_link_and_llm
+
+# 下采样率
+downsample_rate: 4
+
+# Adapter 类型
+adapter_type: gxl
+
+# Encoder 配置 (Whisper-style Transformer)
+encoder: transformer
+input_dim: 80
+encoder_conf:
+  activation_type: gelu
+  attention_dropout_rate: 0.0
+  attention_heads: 16
+  dropout_rate: 0.1
+  gradient_checkpointing: true
+  input_layer: conv1d2
+  key_bias: false
+  linear_units: 4096
+  normalize_before: true
+  num_blocks: 24
+  output_size: 1024
+  pos_enc_layer_type: abs_pos_whisper
+  positional_dropout_rate: 0.1
+  static_chunk_size: -1
+  use_dynamic_chunk: false
+  use_dynamic_left_chunk: false
+
+# Decoder 配置 (仅用于兼容性, llmasr 不使用传统 decoder)
+decoder: transformer
+decoder_conf:
+  activation_type: gelu
+  attention_heads: 16
+  dropout_rate: 0.1
+  gradient_checkpointing: true
+  input_layer: embed_learnable_pe
+  key_bias: false
+  linear_units: 4096
+  normalize_before: true
+  num_blocks: 24
+  positional_dropout_rate: 0.1
+  self_attention_dropout_rate: 0.0
+  src_attention: true
+  src_attention_dropout_rate: 0.0
+  tie_word_embedding: true
+  use_output_layer: true
+
+# CTC (推理时不需要, ctc_weight=0)
+ctc_conf:
+  ctc_blank_id: 50362
+
+# 模型 config
+model_conf:
+  ctc_weight: 0
+  length_normalized_loss: false
+  lsm_weight: 0.1
+
+# 训练参数 (仅用于兼容)
+init_step: true
+grad_clip: 5
+accum_grad: 4
+log_interval: 10
+save_interval: 5000
+max_epoch: 100
+cmvn: null
+cmvn_conf:
+  cmvn_file: null
+  is_json_cmvn: null
+
+# 优化器配置 (仅用于兼容)
+optim: adamw
+optim_conf:
+  betas: [0.9, 0.99]
+  eps: 1.0e-06
+  lr: 5.0e-05
+  weight_decay: 0.01
+scheduler: warmuplr
+scheduler_conf:
+  warmup_steps: 8000
+
+# 数据集配置 (推理时特征提取用)
+dataset_conf:
+  feats_type: log_mel_spectrogram
+  batch_conf:
+    batch_size: 1
+    batch_type: static
+  filter_conf:
+    max_length: 2900
+    min_length: 0
+    token_max_length: 360
+    token_min_length: 1
+    filter_no_extra_info: false
+    max_seq_len: 1000
+  log_mel_spectrogram_conf:
+    hop_length: 160
+    n_fft: 400
+    num_mel_bins: 80
+    padding: 0
+  resample_conf:
+    resample_rate: 16000
+  spec_aug: false
+  spec_sub: false
+  spec_trim: false
+  speed_perturb: false
+  eod_id: 151643

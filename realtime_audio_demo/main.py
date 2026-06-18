@@ -5,7 +5,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from realtime_audio_demo.config import SILERO_VAD_ENABLED, SILERO_VAD_PRELOAD, STATIC_DIR
+from realtime_audio_demo.config import (
+    EASYTURN_CHECKPOINT,
+    EASYTURN_CONFIG,
+    EASYTURN_ENABLED,
+    EASYTURN_LLM_PATH,
+    EASYTURN_PRELOAD,
+    SILERO_VAD_ENABLED,
+    SILERO_VAD_PRELOAD,
+    STATIC_DIR,
+)
 from realtime_audio_demo.routes import audio, chat, pages
 from realtime_audio_demo.services.silero_vad import SileroVadUnavailable, preload_silero_vad
 from realtime_audio_demo.session_store import cleanup_expired_sessions
@@ -28,6 +37,15 @@ async def _session_cleanup_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info(
+        "EasyTurn config enabled=%s preload=%s config=%s checkpoint_configured=%s llm_path_configured=%s",
+        EASYTURN_ENABLED,
+        EASYTURN_PRELOAD,
+        EASYTURN_CONFIG,
+        bool(EASYTURN_CHECKPOINT),
+        bool(EASYTURN_LLM_PATH),
+    )
+
     if SILERO_VAD_ENABLED and SILERO_VAD_PRELOAD:
         try:
             status = await asyncio.to_thread(preload_silero_vad)
@@ -39,6 +57,17 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             app.state.silero_vad = {"preloaded": False, "error": str(exc)}
             logger.exception("Silero VAD preload failed")
+
+    if EASYTURN_ENABLED and EASYTURN_PRELOAD:
+        try:
+            from easy_turn.service import preload_easy_turn
+
+            await asyncio.to_thread(preload_easy_turn)
+            app.state.easy_turn = {"preloaded": True}
+            logger.info("EasyTurn preloaded")
+        except Exception as exc:
+            app.state.easy_turn = {"preloaded": False, "error": str(exc)}
+            logger.exception("EasyTurn preload failed")
 
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
     try:
