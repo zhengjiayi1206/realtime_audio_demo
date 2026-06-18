@@ -34,6 +34,11 @@ export EASYTURN_MAX_AUDIO_SECONDS="${EASYTURN_MAX_AUDIO_SECONDS:-30}"
 export RUNTIME_SKILLS_DIR="${RUNTIME_SKILLS_DIR:-${SCRIPT_DIR}/runtime_skills}"
 export REALTIME_DEFAULT_SKILLS="${REALTIME_DEFAULT_SKILLS:-}"
 export REALTIME_SKILL_MAX_CHARS="${REALTIME_SKILL_MAX_CHARS:-12000}"
+# Full-duplex chunk config
+export CHUNK_DURATION_S="${CHUNK_DURATION_S:-1.0}"
+export ROLLING_AUDIO_CONTEXT_S="${ROLLING_AUDIO_CONTEXT_S:-4.0}"
+export TEXT_HISTORY_TURNS="${TEXT_HISTORY_TURNS:-120}"
+export MAX_RESPONSE_CHARS="${MAX_RESPONSE_CHARS:-10}"
 export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-55785}"
 
@@ -48,11 +53,12 @@ if [[ -f "${PID_FILE}" ]]; then
   fi
 fi
 
-nohup "${VENV_PY}" -m uvicorn app:app --host "${HOST}" --port "${PORT}" --log-level info > "${LOG_FILE}" 2>&1 &
+nohup "${VENV_PY}" -m uvicorn full_duplex_demo.app:app --host "${HOST}" --port "${PORT}" --log-level info > "${LOG_FILE}" 2>&1 &
 pid="$!"
 echo "${pid}" > "${PID_FILE}"
 
 echo "Started demo backend: pid=${pid}"
 echo "URL: http://127.0.0.1:${PORT}"
+echo "Full-duplex: http://127.0.0.1:${PORT}/full_duplex"
 echo "Log: ${LOG_FILE}"
 echo "Stop: kill \$(cat ${PID_FILE})"

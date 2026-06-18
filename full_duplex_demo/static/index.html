@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Full-Duplex Omni-Flow Demo</title>
+<style>
+  :root {
+    --bg: #0f172a; --surface: #1e293b; --border: #334155;
+    --text: #e2e8f0; --dim: #94a3b8; --accent: #38bdf8;
+    --green: #4ade80; --yellow: #facc15; --red: #f87171; --purple: #c084fc;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+  }
+  .container { width: 100%; max-width: 960px; padding: 20px; }
+
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .subtitle { color: var(--dim); font-size: 0.82rem; margin-bottom: 18px; }
+
+  /* Controls */
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  button {
+    padding: 10px 22px; border: none; border-radius: 8px;
+    font-size: 0.95rem; cursor: pointer; font-weight: 600;
+  }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-start { background: var(--green); color: #0f172a; }
+  .btn-stop { background: var(--red); color: #fff; }
+  .status {
+    padding: 5px 12px; border-radius: 20px; font-size: 0.78rem; font-weight: 600;
+    background: var(--border); color: var(--dim);
+  }
+  .status.listening { background: #166534; color: var(--green); }
+  .status.thinking { background: #713f12; color: var(--yellow); }
+
+  .level-bar {
+    width: 100%; height: 4px; background: var(--border); border-radius: 2px;
+    margin-bottom: 16px; overflow: hidden;
+  }
+  .level-fill { height: 100%; background: var(--accent); width: 0%; border-radius: 2px; transition: width 60ms; }
+
+  /* Log */
+  .log-title {
+    font-size: 0.78rem; color: var(--dim); text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 8px;
+  }
+  .log {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.78rem; line-height: 1.6; max-height: 520px; overflow-y: auto;
+  }
+  .log .line { padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+  .log .ts { color: var(--dim); margin-right: 8px; }
+  .log .ev-ready, .log .ev-hello_ok, .log .ev-pong { color: var(--dim); }
+  .log .ev-chunk_processing { color: var(--yellow); }
+  .log .ev-model_input { color: var(--purple); white-space: pre-wrap; }
+  .log .ev-text_delta { color: var(--accent); }
+  .log .ev-chunk_done { color: var(--green); }
+  .log .ev-error { color: var(--red); }
+
+  /* Omni-Flow sequence */
+  .seq-title {
+    font-size: 0.78rem; color: var(--dim); text-transform: uppercase;
+    letter-spacing: 1px; margin: 16px 0 8px;
+  }
+  .seq {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.76rem; line-height: 1.7; max-height: 280px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all; color: var(--dim);
+  }
+  .seq .v { color: var(--purple); }  /* visual */
+  .seq .a { color: var(--accent); }  /* audio */
+  .seq .o { color: var(--green); }   /* output */
+  .seq .s { color: var(--border); }   /* separator */
+  .seq .t { color: var(--yellow); }   /* timestamp */
+
+  .empty { text-align:center; padding:30px; color:var(--dim); }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>🔊 Full-Duplex · Omni-Flow 窗口拼接</h1>
+  <p class="subtitle">
+    前端只采音。后端每秒拼接 [音频·模型输出] → Qwen3-Omni 流式推理。
+    模型最多 <b id="maxCharsLabel">10</b> 字/窗口。
+  </p>
+
+  <div class="controls">
+    <button class="btn-start" id="btnStart" onclick="start()">▶ 开始</button>
+    <button class="btn-stop" id="btnStop" onclick="stop()" disabled>⏹ 停止</button>
+    <span class="status" id="statusBadge">空闲</span>
+  </div>
+
+  <div class="level-bar"><div class="level-fill" id="levelFill"></div></div>
+
+  <div class="log-title">📋 服务端事件日志</div>
+  <div class="log" id="log"><div class="empty">点击"开始"连接服务端</div></div>
+
+  <div class="seq-title">🔗 Omni-Flow 序列（服务端实际发送给模型的 messages）</div>
+  <div class="seq" id="seq"><span style="color:var(--dim)">等待开始...</span></div>
+
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  前端只做：采音 → WebSocket 发送 → 展示事件。零业务逻辑。
+// ═══════════════════════════════════════════════════════════════
+
+let audioCtx = null, processor = null, stream = null, ws = null;
+
+async function start() {
+  document.getElementById('btnStart').disabled = true;
+  document.getElementById('log').innerHTML = '';
+
+  // 1. Open WebSocket
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/full_duplex`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    log('ws', 'connected', 'ev-ready');
+    setStatus('listening', '连接中...');
+
+    // 2. Start mic
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      });
+    } catch(e) {
+      log('error', '麦克风失败: ' + e.message, 'ev-error');
+      document.getElementById('btnStart').disabled = false;
+      return;
+    }
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    const source = audioCtx.createMediaStreamSource(stream);
+
+    // ScriptProcessorNode: raw PCM
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    let leftover = new Float32Array(0);
+    const CHUNK_SAMPLES = 3200; // 200ms at 16kHz
+
+    processor.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const input = e.inputBuffer.getChannelData(0);
+      const combined = new Float32Array(leftover.length + input.length);
+      combined.set(leftover, 0);
+      combined.set(input, leftover.length);
+
+      // Level meter
+      let rms = 0;
+      for (let i = 0; i < input.length; i++) rms += input[i] * input[i];
+      rms = Math.sqrt(rms / input.length);
+      document.getElementById('levelFill').style.width = Math.min(100, rms * 400) + '%';
+
+      let offset = 0;
+      while (offset + CHUNK_SAMPLES <= combined.length) {
+        const chunk = combined.slice(offset, offset + CHUNK_SAMPLES);
+        ws.send(chunk.buffer);
+        offset += CHUNK_SAMPLES;
+      }
+      leftover = combined.slice(offset);
+    };
+
+    // 3. Send hello
+    ws.send(JSON.stringify({ type: 'hello', sampleRate: 16000 }));
+    setStatus('listening', '录音中 · 等待服务端...');
+    document.getElementById('btnStop').disabled = false;
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    handleEvent(data);
+  };
+
+  ws.onerror = () => { log('error', 'WebSocket 错误', 'ev-error'); stop(); };
+  ws.onclose = () => { if (ws) stop(); };
+}
+
+function stop() {
+  if (processor) { processor.disconnect(); processor = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (audioCtx) { audioCtx.close().catch(()=>{}); audioCtx = null; }
+  if (ws) { try { ws.close(); } catch(_) {} ws = null; }
+  document.getElementById('btnStart').disabled = false;
+  document.getElementById('btnStop').disabled = true;
+  document.getElementById('levelFill').style.width = '0%';
+  setStatus('idle', '空闲');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Display server events — no logic, just render
+// ═══════════════════════════════════════════════════════════════
+
+const chunkText = {}; // {idx: accumulated_text} — for seq view only
+let lastModelInput = '';
+
+function handleEvent(data) {
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  const t = data.type;
+
+  switch (t) {
+    case 'ready':
+      log(t, `session=${data.session_id}`, 'ev-ready');
+      break;
+
+    case 'hello_ok':
+      document.getElementById('maxCharsLabel').textContent = data.max_response_chars;
+      log(t, `sr=${data.sample_rate}Hz chunk=${data.chunk_duration_s}s rolling=${data.rolling_audio_context_s}s max_chars=${data.max_response_chars} model=${data.model}`, 'ev-hello_ok');
+      break;
+
+    case 'chunk_processing':
+      log(t, `窗口 #${data.chunk_index} → Qwen3-Omni 推理中...`, 'ev-chunk_processing');
+      chunkText[data.chunk_index] = '';
+      updateSeq(data.chunk_index, '...');
+      break;
+
+    case 'model_input':
+      lastModelInput = data.text || '';
+      log(t, `#${data.chunk_index}\n${data.text || ''}`, 'ev-model_input');
+      updateSeq(data.chunk_index, chunkText[data.chunk_index] || '...');
+      break;
+
+    case 'listen_speak':
+      log(t, `#${data.chunk_index} ${data.state}`, 'ev-chunk_processing');
+      break;
+
+    case 'text_delta':
+      chunkText[data.chunk_index] = (chunkText[data.chunk_index] || '') + data.text;
+      log(t, `#${data.chunk_index}：「${data.text}」`, 'ev-text_delta');
+      updateSeq(data.chunk_index, chunkText[data.chunk_index]);
+      break;
+
+    case 'chunk_done':
+      chunkText[data.chunk_index] = data.text || '';
+      log(t, `#${data.chunk_index} 完成：「${data.text || '(空)'}」 ${data.latency_ms}ms TTFT=${data.ttft_ms}ms`, 'ev-chunk_done');
+      updateSeq(data.chunk_index, data.text || '');
+      setStatus('listening', `第${data.chunk_index}秒完成`);
+      break;
+
+    case 'error':
+      log(t, data.message, 'ev-error');
+      break;
+
+    case 'pong':
+      log(t, '', 'ev-pong');
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Omni-Flow sequence view (rendered on client for visualization)
+// ═══════════════════════════════════════════════════════════════
+
+function updateSeq(idx, text) {
+  const el = document.getElementById('seq');
+  const indices = Object.keys(chunkText).map(Number).sort((a,b) => a-b);
+
+  let html = '<span class="s">╔══ latest model input ═══════════════════════════╗</span>\n';
+  html += lastModelInput
+    ? `<span class="t">${esc(lastModelInput)}</span>\n`
+    : '<span class="t">等待服务端 model_input 事件...</span>\n';
+  html += '<span class="s">╚══════════════════════════════════════════════════╝</span>\n\n';
+
+  for (const i of indices) {
+    const t = chunkText[i] || '...';
+    html += `<span class="s">──── 窗口 ${i}  [${(i-1).toFixed(1)}s – ${i.toFixed(1)}s] ────</span>\n`;
+    html += `<span class="a">  📥 audio  →  [第${i}秒音频]</span>\n`;
+    html += `<span class="o">  🤖 model  →  「${esc(t)}」</span>\n\n`;
+  }
+
+  if (indices.length === 0) {
+    html += '<span style="color:var(--dim)">等待音频输入...</span>';
+  }
+
+  el.innerHTML = html;
+  el.scrollTop = el.scrollHeight;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════
+
+function log(type, msg, cls) {
+  const el = document.getElementById('log');
+  const empty = el.querySelector('.empty');
+  if (empty) empty.remove();
+
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  const div = document.createElement('div');
+  div.className = 'line';
+  div.innerHTML = `<span class="ts">${ts}</span><span class="${cls || ''}">[${type}]</span> ${esc(msg)}`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+
+  // Keep ~200 lines max
+  while (el.children.length > 200) el.removeChild(el.firstChild);
+}
+
+function setStatus(cls, text) {
+  const b = document.getElementById('statusBadge');
+  b.className = 'status ' + (cls || '');
+  b.textContent = text;
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>
