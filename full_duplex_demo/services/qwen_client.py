@@ -100,19 +100,25 @@ def build_listen_speak_payload(
     model: str,
     wav_bytes: bytes,
     system_prompt: str,
+    context_text: str | None = None,
 ) -> dict[str, Any]:
     """Build a non-streaming payload that returns only speak/listen."""
     provider = resolved_provider()
+    user_content: list[dict[str, Any]] = []
+    if context_text:
+        user_content.append({"type": "text", "text": context_text})
+    user_content.extend([
+        {"type": "text", "text": "请判断这段用户音频是否已经说完。"},
+        _audio_item(wav_bytes),
+    ])
+
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": "请判断这段用户音频是否已经说完。"},
-                    _audio_item(wav_bytes),
-                ],
+                "content": user_content,
             },
         ],
         "chat_template_kwargs": {"sampling_rate": TARGET_SAMPLE_RATE},

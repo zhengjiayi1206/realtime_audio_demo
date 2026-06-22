@@ -10,6 +10,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from full_duplex_demo.config import (
     CHUNK_DURATION_S,
     LISTEN_SPEAK_PROMPT,
+    LISTEN_SPEAK_PROMPT_2,
     MAX_RESPONSE_CHARS,
     QWEN_API_BASE,
     QWEN_MODEL,
@@ -107,6 +108,8 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
     chunk_idx: int = 0
     flow_history: list[dict[str, Any]] = []  # prior chat messages, kept unchanged
     inferring: bool = False           # guards against overlapping requests
+    assistant_has_floor: bool = False # true after AI starts/continues speaking
+    current_assistant_text: str = ""  # visible text in the current assistant turn
 
     # --- helpers ---
 
@@ -135,7 +138,7 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
         chunk_idx_local: int,
         audio_chunks: list[bytes],
     ) -> None:
-        nonlocal inferring
+        nonlocal assistant_has_floor, current_assistant_text, inferring
 
         t0 = time.perf_counter()
 
@@ -179,10 +182,19 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
 
         # 3. Run turn-taking judgement and reply generation in parallel.
         # Reply deltas stay buffered until the judgement returns "speak".
+        judging_assistant_interrupt = assistant_has_floor
+        judge_prompt = LISTEN_SPEAK_PROMPT_2 if judging_assistant_interrupt else LISTEN_SPEAK_PROMPT
+        judge_context_text = None
+        if judging_assistant_interrupt:
+            judge_context_text = (
+                "当前 AI 这一轮已经输出的文本如下，请同时判断这段 AI 输出是否已经回答完整：\n"
+                f"{current_assistant_text or '（空）'}"
+            )
         judge_payload = build_listen_speak_payload(
             model=QWEN_MODEL,
             wav_bytes=judge_wav,
-            system_prompt=LISTEN_SPEAK_PROMPT,
+            system_prompt=judge_prompt,
+            context_text=judge_context_text,
         )
 
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -265,6 +277,10 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
         current_user_message = payload["messages"][-1]
 
         if listen_speak == "listen":
+            # If prompt2 detects a user interruption while AI is speaking, keep this
+            # audio as the start of the user's unfinished turn. The next chunk will
+            # be judged with prompt1 until that user turn becomes complete.
+            assistant_has_floor = False
             stream_task.cancel()
             flow_history.append(current_user_message)
             judge_audio_buf.extend(audio_chunks)
@@ -334,6 +350,10 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
         flow_history.append(current_user_message)
         if full_text:
             flow_history.append(_assistant_message(full_text))
+            assistant_has_floor = True
+            current_assistant_text += full_text
+        else:
+            current_assistant_text = "" if not assistant_has_floor else current_assistant_text
         judge_audio_buf.clear()
         while len(flow_history) > TEXT_HISTORY_TURNS * 2:
             flow_history.pop(0)

@@ -31,6 +31,12 @@ if _listen_speak_prompt_path.exists():
 else:
     LISTEN_SPEAK_PROMPT = "判断用户是否已经说完话。只输出 speak 或 listen。"
 
+_listen_speak_prompt_2_path = APP_DIR / "prompt_listen_speak_2.txt"
+if _listen_speak_prompt_2_path.exists():
+    LISTEN_SPEAK_PROMPT_2 = _listen_speak_prompt_2_path.read_text(encoding="utf-8").strip()
+else:
+    LISTEN_SPEAK_PROMPT_2 = "AI正在输出。判断用户是否在说话打断。用户打断输出 listen，否则输出 speak。"
+
 
 def resolved_provider() -> str:
     if QWEN_PROVIDER != "auto":
