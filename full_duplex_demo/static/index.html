@@ -14,9 +14,12 @@
   body {
     font-family: 'Segoe UI', system-ui, sans-serif;
     background: var(--bg); color: var(--text);
-    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    height: 100vh; overflow: hidden;
   }
-  .container { width: 100%; max-width: 960px; padding: 20px; }
+  .container {
+    width: 100%; max-width: 1320px; height: 100vh; padding: 20px; margin: 0 auto;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
 
   h1 { font-size: 1.4rem; margin-bottom: 4px; }
   .subtitle { color: var(--dim); font-size: 0.82rem; margin-bottom: 18px; }
@@ -43,15 +46,60 @@
   }
   .level-fill { height: 100%; background: var(--accent); width: 0%; border-radius: 2px; transition: width 60ms; }
 
+  .main-grid {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 14px; align-items: stretch; min-height: 0; flex: 1;
+  }
+  .panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    min-height: 0; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .panel-header {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 12px 14px; border-bottom: 1px solid var(--border);
+  }
+  .panel-title {
+    font-size: 0.78rem; color: var(--dim); text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .call-state { color: var(--dim); font-size: 0.8rem; white-space: nowrap; }
+  .conversation {
+    flex: 1; padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;
+  }
+  .conversation-empty { color: var(--dim); text-align: center; margin: auto; font-size: 0.9rem; }
+  .bubble-row { display: flex; }
+  .bubble-row.assistant { justify-content: flex-start; }
+  .bubble-row.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 82%; border-radius: 8px; padding: 10px 12px;
+    line-height: 1.55; font-size: 0.95rem; word-break: break-word;
+  }
+  .bubble.assistant { background: #0f766e; color: #ecfeff; }
+  .bubble.user {
+    background: #273449; color: var(--dim); border: 1px dashed var(--border);
+    
+    font-size: 0.86rem;
+  }
+  .typing-dots { display: inline-flex; gap: 4px; margin-left: 6px; vertical-align: middle; }
+  .typing-dots span {
+    width: 5px; height: 5px; border-radius: 50%; background: var(--dim);
+    animation: pulse 1s infinite ease-in-out;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes pulse {
+    0%, 80%, 100% { opacity: 0.35; transform: translateY(0); }
+    40% { opacity: 1; transform: translateY(-2px); }
+  }
+
   /* Log */
   .log-title {
     font-size: 0.78rem; color: var(--dim); text-transform: uppercase;
     letter-spacing: 1px; margin-bottom: 8px;
   }
   .log {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-    padding: 12px; font-family: 'Cascadia Code', 'Fira Code', monospace;
-    font-size: 0.78rem; line-height: 1.6; max-height: 520px; overflow-y: auto;
+    flex: 1; padding: 12px; font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 0.76rem; line-height: 1.6; overflow-y: auto;
   }
   .log .line { padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
   .log .ts { color: var(--dim); margin-right: 8px; }
@@ -68,9 +116,9 @@
     letter-spacing: 1px; margin: 16px 0 8px;
   }
   .seq {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    border-top: 1px solid var(--border);
     padding: 14px; font-family: 'Cascadia Code', 'Fira Code', monospace;
-    font-size: 0.76rem; line-height: 1.7; max-height: 280px; overflow-y: auto;
+    font-size: 0.72rem; line-height: 1.7; max-height: 230px; overflow-y: auto;
     white-space: pre-wrap; word-break: break-all; color: var(--dim);
   }
   .seq .v { color: var(--purple); }  /* visual */
@@ -80,6 +128,10 @@
   .seq .t { color: var(--yellow); }   /* timestamp */
 
   .empty { text-align:center; padding:30px; color:var(--dim); }
+  @media (max-width: 900px) {
+    .main-grid { grid-template-columns: 1fr; }
+    .panel { min-height: 420px; }
+  }
 </style>
 </head>
 <body>
@@ -99,11 +151,26 @@
 
   <div class="level-bar"><div class="level-fill" id="levelFill"></div></div>
 
-  <div class="log-title">📋 服务端事件日志</div>
-  <div class="log" id="log"><div class="empty">点击"开始"连接服务端</div></div>
+  <div class="main-grid">
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title">实时通话</div>
+        <div class="call-state" id="callState">等待开始</div>
+      </div>
+      <div class="conversation" id="conversation">
+        <div class="conversation-empty">点击"开始"后，AI 回复会显示在这里</div>
+      </div>
+    </section>
 
-  <div class="seq-title">🔗 Omni-Flow 序列（服务端实际发送给模型的 messages）</div>
-  <div class="seq" id="seq"><span style="color:var(--dim)">等待开始...</span></div>
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title">服务端事件日志</div>
+        <div class="call-state">debug</div>
+      </div>
+      <div class="log" id="log"><div class="empty">点击"开始"连接服务端</div></div>
+      <div class="seq" id="seq"><span style="color:var(--dim)">等待开始...</span></div>
+    </section>
+  </div>
 
 </div>
 
@@ -117,6 +184,8 @@ let audioCtx = null, processor = null, stream = null, ws = null;
 async function start() {
   document.getElementById('btnStart').disabled = true;
   document.getElementById('log').innerHTML = '';
+  resetConversation();
+  setCallState('连接中');
 
   // 1. Open WebSocket
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -196,6 +265,7 @@ function stop() {
   document.getElementById('btnStop').disabled = true;
   document.getElementById('levelFill').style.width = '0%';
   setStatus('idle', '空闲');
+  setCallState('已停止');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -204,6 +274,11 @@ function stop() {
 
 const chunkText = {}; // {idx: accumulated_text} — for seq view only
 let lastModelInput = '';
+let assistantTurns = [];
+let activeAssistantTurn = null;
+let shouldStartNewAssistantTurn = true;
+let conversationItems = [];
+let activeUserAudioItem = null;
 
 function handleEvent(data) {
   const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
@@ -212,6 +287,7 @@ function handleEvent(data) {
   switch (t) {
     case 'ready':
       log(t, `session=${data.session_id}`, 'ev-ready');
+      setCallState('已连接，等待音频');
       break;
 
     case 'hello_ok':
@@ -233,16 +309,35 @@ function handleEvent(data) {
 
     case 'listen_speak':
       log(t, `#${data.chunk_index} ${data.state}`, 'ev-chunk_processing');
+      if (data.state === 'listen') {
+        shouldStartNewAssistantTurn = true;
+        activeAssistantTurn = null;
+        ensureUserAudioItem();
+        setCallState('用户正在说话');
+      } else if (data.state === 'speak') {
+        activeUserAudioItem = null;
+        ensureAssistantTurn();
+        setCallState('AI 正在回复');
+      }
+      renderConversation();
       break;
 
     case 'text_delta':
       chunkText[data.chunk_index] = (chunkText[data.chunk_index] || '') + data.text;
+      appendAssistantText(data.text || '');
       log(t, `#${data.chunk_index}：「${data.text}」`, 'ev-text_delta');
       updateSeq(data.chunk_index, chunkText[data.chunk_index]);
       break;
 
     case 'chunk_done':
       chunkText[data.chunk_index] = data.text || '';
+      if (data.listen_speak === 'speak') {
+        if (data.text && activeAssistantTurn && !activeAssistantTurn.text) {
+          activeAssistantTurn.text = data.text;
+          renderConversation();
+        }
+        setCallState('等待用户继续');
+      }
       log(t, `#${data.chunk_index} 完成：「${data.text || '(空)'}」 ${data.latency_ms}ms TTFT=${data.ttft_ms}ms`, 'ev-chunk_done');
       updateSeq(data.chunk_index, data.text || '');
       setStatus('listening', `第${data.chunk_index}秒完成`);
@@ -285,6 +380,70 @@ function updateSeq(idx, text) {
 
   el.innerHTML = html;
   el.scrollTop = el.scrollHeight;
+}
+
+function ensureAssistantTurn() {
+  if (!activeAssistantTurn || shouldStartNewAssistantTurn) {
+    activeAssistantTurn = { id: Date.now() + Math.random(), role: 'assistant', text: '' };
+    assistantTurns.push(activeAssistantTurn);
+    conversationItems.push(activeAssistantTurn);
+    shouldStartNewAssistantTurn = false;
+  }
+  return activeAssistantTurn;
+}
+
+function appendAssistantText(text) {
+  if (!text) return;
+  const turn = ensureAssistantTurn();
+  turn.text += text;
+  renderConversation();
+}
+
+function renderConversation() {
+  const el = document.getElementById('conversation');
+  let html = '';
+
+  for (const item of conversationItems) {
+    if (item.role === 'assistant' && item.text) {
+      html += `<div class="bubble-row assistant"><div class="bubble assistant">${esc(item.text)}</div></div>`;
+    } else if (item.role === 'user_audio') {
+      const suffix = item.active
+        ? '<span class="typing-dots"><span></span><span></span><span></span></span>'
+        : '';
+      html += `<div class="bubble-row user"><div class="bubble user">用户音频输入${suffix}</div></div>`;
+    }
+  }
+
+  if (!html) {
+    html = '<div class="conversation-empty">点击"开始"后，AI 回复会显示在这里</div>';
+  }
+
+  el.innerHTML = html;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setCallState(text) {
+  document.getElementById('callState').textContent = text;
+}
+
+function resetConversation() {
+  assistantTurns = [];
+  activeAssistantTurn = null;
+  shouldStartNewAssistantTurn = true;
+  conversationItems = [];
+  activeUserAudioItem = null;
+  for (const key of Object.keys(chunkText)) delete chunkText[key];
+  lastModelInput = '';
+  renderConversation();
+  updateSeq(0, '');
+}
+
+function ensureUserAudioItem() {
+  if (!activeUserAudioItem) {
+    activeUserAudioItem = { id: Date.now() + Math.random(), role: 'user_audio', active: true };
+    conversationItems.push(activeUserAudioItem);
+  }
+  activeUserAudioItem.active = true;
 }
 
 // ═══════════════════════════════════════════════════════════════

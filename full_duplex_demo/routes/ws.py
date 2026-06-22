@@ -22,7 +22,7 @@ from full_duplex_demo.services.qwen_client import (
     build_omniflow_payload,
     build_listen_speak_payload,
     complete_json_sync,
-    extract_message_text,
+    extract_listen_speak_text,
     extract_stream_delta,
     stream_json_sync,
 )
@@ -78,13 +78,14 @@ def _payload_preview(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _parse_listen_speak(text: str) -> str:
-    cleaned = text.strip().lower()
-    if "speak" in cleaned:
-        return "speak"
-    if "listen" in cleaned:
-        return "listen"
-    return "listen"
+def _assistant_message(text: str) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": text},
+        ],
+    }
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -176,20 +177,84 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
                          chunk_index=chunk_idx_local,
                          text=preview)
 
-        try:
-            judge_payload = build_listen_speak_payload(
-                model=QWEN_MODEL,
-                wav_bytes=judge_wav,
-                system_prompt=LISTEN_SPEAK_PROMPT,
-            )
-            judge_resp = await asyncio.to_thread(
+        # 3. Run turn-taking judgement and reply generation in parallel.
+        # Reply deltas stay buffered until the judgement returns "speak".
+        judge_payload = build_listen_speak_payload(
+            model=QWEN_MODEL,
+            wav_bytes=judge_wav,
+            system_prompt=LISTEN_SPEAK_PROMPT,
+        )
+
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def push(item: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+
+        judge_task = asyncio.create_task(
+            asyncio.to_thread(
                 complete_json_sync,
                 f"{QWEN_API_BASE}/chat/completions",
                 judge_payload,
             )
-            listen_speak = _parse_listen_speak(extract_message_text(judge_resp))
+        )
+        stream_task = asyncio.create_task(
+            asyncio.to_thread(
+                stream_json_sync,
+                f"{QWEN_API_BASE}/chat/completions",
+                payload,
+                push,
+            )
+        )
+
+        buffered_deltas: list[str] = []
+        text_parts: list[str] = []
+        visible_chars = 0
+        ttft_ms: int | None = None
+        listen_speak: str | None = None
+        reply_done = False
+
+        try:
+            while listen_speak is None:
+                get_task = asyncio.create_task(queue.get())
+                done, pending = await asyncio.wait(
+                    {judge_task, get_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if judge_task in done:
+                    judge_resp = judge_task.result()
+                    listen_speak = extract_listen_speak_text(judge_resp)
+
+                if get_task in done:
+                    item = get_task.result()
+                    itype = item.get("type")
+
+                    if itype == "done":
+                        reply_done = True
+                    elif itype == "ttft":
+                        ttft_ms = item.get("ttft_ms")
+                    elif itype == "error":
+                        await send_event("error", message=item.get("message", "stream error")[:500])
+                        stream_task.cancel()
+                        inferring = False
+                        return
+                    else:
+                        chunk_data = item.get("data")
+                        if isinstance(chunk_data, dict):
+                            delta = extract_stream_delta(chunk_data)
+                            if delta and visible_chars < MAX_RESPONSE_CHARS:
+                                remaining = MAX_RESPONSE_CHARS - visible_chars
+                                visible_delta = delta[:remaining]
+                                visible_chars += len(visible_delta)
+                                text_parts.append(visible_delta)
+                                buffered_deltas.append(visible_delta)
+
+                if get_task in pending:
+                    get_task.cancel()
         except Exception as exc:
-            await send_event("error", message=f"listen/speak judge failed: {exc}")
+            stream_task.cancel()
+            await send_event("error", message=f"parallel inference failed: {exc}")
             inferring = False
             return
 
@@ -200,6 +265,7 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
         current_user_message = payload["messages"][-1]
 
         if listen_speak == "listen":
+            stream_task.cancel()
             flow_history.append(current_user_message)
             judge_audio_buf.extend(audio_chunks)
             while len(flow_history) > TEXT_HISTORY_TURNS * 2:
@@ -215,32 +281,18 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
             inferring = False
             return
 
-        # 3. Stream from Qwen
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-
-        def push(item: dict[str, Any]) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, item)
-
-        stream_task = asyncio.create_task(
-            asyncio.to_thread(
-                stream_json_sync,
-                f"{QWEN_API_BASE}/chat/completions",
-                payload,
-                push,
-            )
-        )
-
-        text_parts: list[str] = []
-        visible_chars = 0
-        ttft_ms: int | None = None
+        for visible_delta in buffered_deltas:
+            send_fire_and_forget("text_delta",
+                                 chunk_index=chunk_idx_local,
+                                 text=visible_delta)
 
         try:
-            while True:
+            while not reply_done:
                 item = await queue.get()
                 itype = item.get("type")
 
                 if itype == "done":
+                    reply_done = True
                     break
                 if itype == "ttft":
                     ttft_ms = item.get("ttft_ms")
@@ -280,10 +332,8 @@ async def full_duplex_ws(websocket: WebSocket) -> None:
         )
 
         flow_history.append(current_user_message)
-        flow_history.append({
-            "role": "assistant",
-            "content": full_text or "嗯",
-        })
+        if full_text:
+            flow_history.append(_assistant_message(full_text))
         judge_audio_buf.clear()
         while len(flow_history) > TEXT_HISTORY_TURNS * 2:
             flow_history.pop(0)

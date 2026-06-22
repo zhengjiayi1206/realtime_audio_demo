@@ -49,6 +49,10 @@ def _audio_item(wav_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def _text_item(text: str) -> dict[str, str]:
+    return {"type": "text", "text": text}
+
+
 def build_omniflow_payload(
     *,
     model: str,
@@ -64,13 +68,12 @@ def build_omniflow_payload(
     current_user_message = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "当前这一段：用户输入音频如下。"},
             _audio_item(wav_bytes),
         ],
     }
 
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": [_text_item(system_prompt)]},
         *flow_history,
         current_user_message,
     ]
@@ -223,3 +226,16 @@ def extract_message_text(data: dict[str, Any]) -> str:
         if isinstance(content, str):
             return content
     return ""
+
+
+def extract_listen_speak_text(data: dict[str, Any]) -> str:
+    return _parse_listen_speak_text(extract_message_text(data))
+
+
+def _parse_listen_speak_text(text: str) -> str:
+    cleaned = text.strip().lower()
+    if "speak" in cleaned:
+        return "speak"
+    if "listen" in cleaned:
+        return "listen"
+    return "listen"
