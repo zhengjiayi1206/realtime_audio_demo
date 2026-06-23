@@ -308,7 +308,7 @@ function handleEvent(data) {
       break;
 
     case 'listen_speak':
-      log(t, `#${data.chunk_index} ${data.state}`, 'ev-chunk_processing');
+      log(t, `#${data.chunk_index} ${data.state} mode=${data.judge_mode || '-'}`, 'ev-chunk_processing');
       if (data.state === 'listen') {
         shouldStartNewAssistantTurn = true;
         activeAssistantTurn = null;
@@ -325,7 +325,7 @@ function handleEvent(data) {
     case 'text_delta':
       chunkText[data.chunk_index] = (chunkText[data.chunk_index] || '') + data.text;
       appendAssistantText(data.text || '');
-      log(t, `#${data.chunk_index}：「${data.text}」`, 'ev-text_delta');
+      log(t, `#${data.chunk_index}：「${data.raw_text ?? data.text}」`, 'ev-text_delta');
       updateSeq(data.chunk_index, chunkText[data.chunk_index]);
       break;
 
