@@ -41,11 +41,12 @@ from realtime_audio_demo.services.qwen import (
     build_chat_payload,
     extract_model_output,
     extract_stream_delta,
+    json_object_response_format,
     normalize_history,
     post_json,
     stream_json_sync,
 )
-from realtime_audio_demo.services.skill_loader import compose_realtime_prompt
+from realtime_audio_demo.services.skill_loader import compose_realtime_prompt, normalize_skill_name
 from realtime_audio_demo.services.silero_vad import SileroVadConfig, SileroVadSession, SileroVadUnavailable
 from realtime_audio_demo.services.text_chat import request_text_completion
 from realtime_audio_demo.session_store import (
@@ -60,6 +61,7 @@ from realtime_audio_demo.utils.audio import float32_sample_count, wav_bytes_from
 
 router = APIRouter()
 logger = logging.getLogger("uvicorn.error")
+INTENT_RECOGNITION_SKILL = "intent-recognition"
 
 
 SPEECH_PROMPT = (
@@ -90,6 +92,7 @@ async def chatbox_text(request: Request) -> JSONResponse:
     prompt, used_skills, missing_skills = compose_realtime_prompt("", skill_names)
     history = normalize_history(await get_session_history(session_id)) if session_id else normalize_history(payload.get("history"))
     output_audio = bool(payload.get("outputAudio"))
+    response_format = json_object_response_format() if should_force_intent_json(skill_names) else None
     result, status_code = await request_text_completion(
         model=model,
         text=user_text,
@@ -97,6 +100,7 @@ async def chatbox_text(request: Request) -> JSONResponse:
         history=history,
         max_tokens=FINAL_MAX_TOKENS,
         output_audio=False,
+        response_format=response_format,
     )
     if status_code >= 400:
         return JSONResponse(result, status_code=status_code)
@@ -137,19 +141,6 @@ async def chatbox_text(request: Request) -> JSONResponse:
         result["text"] = final_text
 
     normalized = normalize_assistant_output(result.get("text"))
-
-    # When output is intent JSON but no business skill was selected,
-    # use the content field as the displayed text (keep full JSON in history).
-    _intent_text = normalized.history_text
-    if normalized.is_json and not new_session:
-        try:
-            parsed = json.loads(normalized.history_text)
-            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
-                _display = parsed["content"].strip()
-                if _display:
-                    result["text"] = _display
-        except (json.JSONDecodeError, TypeError):
-            pass
 
     result["history_text"] = normalized.history_text
     result["speech_text"] = normalized.speech_text
@@ -420,6 +411,7 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
         session.prefill_ms = int(payload.get("prefillMs") or DEFAULT_PREFILL_MS)
         session.model = normalize_model_name(payload.get("model") or QWEN_MODEL)
         session.route_context = str(payload.get("routeContext") or "").strip()
+        session.conversation_mode = normalize_conversation_mode(payload.get("conversationMode"))
         session.output_audio = bool(payload.get("outputAudio"))
         session.stream_speech_audio = bool(payload.get("streamSpeechAudio"))
         await configure_vad(session, payload.get("vad"))
@@ -462,6 +454,7 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
                 "prefill_ms": session.prefill_ms,
                 "model": session.model,
                 "qwen_api_base": QWEN_API_BASE,
+                "conversation_mode": session.conversation_mode,
                 "history_messages": len(session.history),
                 "skills": used_skills,
                 "missing_skills": missing_skills,
@@ -472,13 +465,14 @@ async def handle_control_message(session: AudioSession, text: str) -> None:
         )
     elif event_type == "stop":
         logger.info(
-            "audio stop received session=%s chunks=%d easyturn_enabled=%s",
+            "audio stop received session=%s mode=%s chunks=%d easyturn_enabled=%s",
             session.session_id,
+            session.conversation_mode,
             len(session.chunks),
             EASYTURN_ENABLED,
         )
         await send_event(session, "finalizing", {"chunks": len(session.chunks)})
-        if await maybe_handle_easy_turn_stop(session):
+        if session.conversation_mode == "realtime" and await maybe_handle_easy_turn_stop(session):
             return
         session.stopped = True
         await finalize_session(session)
@@ -494,6 +488,17 @@ def normalize_skill_names(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
+
+
+def normalize_conversation_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode == "realtime":
+        return "realtime"
+    return "manual"
+
+
+def should_force_intent_json(skill_names: list[str]) -> bool:
+    return any(normalize_skill_name(name) == INTENT_RECOGNITION_SKILL for name in skill_names)
 
 
 async def synthesize_speech_audio(model: str, text: str | None) -> str | None:
@@ -902,6 +907,7 @@ async def finalize_session(session: AudioSession) -> None:
         history=session.history,
         max_tokens=FINAL_MAX_TOKENS,
         modalities=["text"],
+        response_format=json_object_response_format() if should_force_intent_json(session.skill_names) else None,
     )
     start = time.perf_counter()
 
@@ -950,18 +956,6 @@ async def finalize_session(session: AudioSession) -> None:
         )
     text, component_call, component_result = await resolve_component_output(session, text)
     normalized = normalize_assistant_output(text)
-
-    # When output is intent JSON but no business skill was selected,
-    # use the content field as the displayed text.
-    if normalized.is_json and not routing_meta.get("new_session"):
-        try:
-            parsed = json.loads(normalized.history_text)
-            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
-                _display = parsed["content"].strip()
-                if _display:
-                    text = _display
-        except (json.JSONDecodeError, TypeError):
-            pass
 
     # Append to session history
     if session.chat_session_id:
@@ -1130,18 +1124,6 @@ async def stream_final_session(
     text, component_call, component_result = await resolve_component_output(session, text)
     normalized = normalize_assistant_output(text)
 
-    # When output is intent JSON but no business skill was selected,
-    # use the content field as the displayed text.
-    if normalized.is_json and not routing_meta.get("new_session"):
-        try:
-            parsed = json.loads(normalized.history_text)
-            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
-                _display = parsed["content"].strip()
-                if _display:
-                    text = _display
-        except (json.JSONDecodeError, TypeError):
-            pass
-
     # Append to session history
     if session.chat_session_id:
         await append_history(session.chat_session_id, "user", user_history_text)
@@ -1202,6 +1184,7 @@ def build_final_result_payload(
             "history_text": normalized.history_text,
             "speech_text": normalized.speech_text,
             "user_history_text": user_history_text,
+            "user_display_text": user_history_text,
             "output_is_json": normalized.is_json,
             "component_call": component_call,
             "component_result": component_result,

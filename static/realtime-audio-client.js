@@ -33,12 +33,14 @@ export class RealtimeAudioClient extends EventTarget {
       getPrompt: () => "",
       getPrefillMs: () => 600,
       getRouteContext: () => "",
+      getConversationMode: () => "manual",
       getSessionId: () => "",
       getSkillNames: () => [],
       getOutputAudio: () => false,
       getStreamSpeechAudio: () => false,
       getVadConfig: () => null,
       getBargeInVadConfig: () => null,
+      shouldAutoStartOnVad: () => false,
       getVadMonitorWebSocketUrl: defaultVadMonitorWebSocketUrl,
       shouldAutoStopOnVad: () => true,
       useWebAudioPlayback: false,
@@ -136,49 +138,50 @@ export class RealtimeAudioClient extends EventTarget {
   // ═══════════════════════════════════════════════════════════
 
   async _ensurePersistentMic() {
-    if (this.state._persistentMic) return;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-    const audioContext = new AudioContext({ latencyHint: "interactive" });
-    await audioContext.audioWorklet.addModule(this.options.recorderWorkletUrl);
-    const source = audioContext.createMediaStreamSource(stream);
-    const chunkMs = Number(this.options.getPrefillMs() || 600);
-    const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
-      processorOptions: { chunkMs, vadFrameMs: this.options.vadFrameMs },
-    });
-    const sink = audioContext.createGain();
-    sink.gain.value = 0;
-    source.connect(node);
-    node.connect(sink);
-    sink.connect(audioContext.destination);
+    if (!this.state._persistentMic) {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      const audioContext = new AudioContext({ latencyHint: "interactive" });
+      await audioContext.audioWorklet.addModule(this.options.recorderWorkletUrl);
+      const source = audioContext.createMediaStreamSource(stream);
+      const chunkMs = Number(this.options.getPrefillMs() || 600);
+      const node = new AudioWorkletNode(audioContext, "pcm-chunker", {
+        processorOptions: { chunkMs, vadFrameMs: this.options.vadFrameMs },
+      });
+      const sink = audioContext.createGain();
+      sink.gain.value = 0;
+      source.connect(node);
+      node.connect(sink);
+      sink.connect(audioContext.destination);
 
-    const ringBuf = new AudioRingBuffer(120000);
-    this.state._ringBuffer = ringBuf;
+      const ringBuf = new AudioRingBuffer(Number(this.options.bargeInPreBufferMs || 120000));
+      this.state._ringBuffer = ringBuf;
 
-    node.port.onmessage = (event) => {
-      if (!event.data) return;
-      if (event.data.type === "level") { this.handleVadLevel(event.data); return; }
-      if (event.data.type === "flushed") { this.resolveFlush(); return; }
-      if (event.data.type !== "chunk") return;
-      // always feed ring buffer
-      ringBuf.push(event.data.pcm, audioContext.sampleRate, chunkMs);
-      // feed persistent VAD WS
-      if (this.state._persistentVadWs && this.state._persistentVadWs.readyState === WebSocket.OPEN) {
-        this.state._persistentVadWs.send(event.data.pcm);
-      }
-      // feed audio WS if actively sending
-      if (this.state._sendingAudio && this.state.ws && this.state.ws.readyState === WebSocket.OPEN) {
-        this.state.ws.send(event.data.pcm);
-        this.state.chunks += 1;
-        this.emitMetrics();
-      }
-    };
+      node.port.onmessage = (event) => {
+        if (!event.data) return;
+        if (event.data.type === "level") { this.handleVadLevel(event.data); return; }
+        if (event.data.type === "flushed") { this.resolveFlush(); return; }
+        if (event.data.type !== "chunk") return;
+        ringBuf.push(event.data.pcm, audioContext.sampleRate, chunkMs);
+        if (this.state._persistentVadWs && this.state._persistentVadWs.readyState === WebSocket.OPEN) {
+          this.state._persistentVadWs.send(event.data.pcm);
+        }
+        if (this.state._sendingAudio && this.state.ws && this.state.ws.readyState === WebSocket.OPEN) {
+          this.state.ws.send(event.data.pcm);
+          this.state.chunks += 1;
+          this.emitMetrics();
+        }
+      };
 
-    this.state._persistentMic = { stream, audioContext, source, node, sink };
-    this.state._persistentMicSampleRate = audioContext.sampleRate;
+      this.state._persistentMic = { stream, audioContext, source, node, sink };
+      this.state._persistentMicSampleRate = audioContext.sampleRate;
+      this.log(`persistent mic started, sampleRate=${audioContext.sampleRate}`);
+    }
 
-    // open persistent VAD WS
+    if (!this.options.shouldAutoStartOnVad() || this.state._persistentVadWs) return;
+
+    const audioContext = this.state._persistentMic.audioContext;
     const vadConfig = this.options.getVadConfig() || {
       engine: "silero", threshold: 0.8, minSpeechMs: 128, minSilenceMs: 800, maxSpeechMs: 30000, speechPadMs: 30,
     };
@@ -189,10 +192,13 @@ export class RealtimeAudioClient extends EventTarget {
     vadWs.onerror = () => this.log("persistent VAD WS error", "error");
     await new Promise((resolve, reject) => {
       vadWs.onopen = resolve;
-      vadWs.onclose = () => reject(new Error("persistent VAD WS closed"));
+      vadWs.onclose = () => {
+        if (this.state._persistentVadWs === vadWs) this.state._persistentVadWs = null;
+        reject(new Error("persistent VAD WS closed"));
+      };
     });
     vadWs.send(JSON.stringify({ type: "start", sampleRate: audioContext.sampleRate, vad: vadConfig }));
-    this.log(`persistent mic+VAD started, sampleRate=${audioContext.sampleRate}`);
+    this.log("persistent VAD started");
   }
 
   _stopPersistentMic() {
@@ -220,6 +226,20 @@ export class RealtimeAudioClient extends EventTarget {
     buf.clear();
   }
 
+  clearPassiveBufferAndResetVad() {
+    if (this.state._ringBuffer) this.state._ringBuffer.clear();
+    if (this.state._persistentVadWs && this.state._persistentVadWs.readyState === WebSocket.OPEN) {
+      const vadConfig = this.options.getVadConfig() || {
+        engine: "silero", threshold: 0.8, minSpeechMs: 128, minSilenceMs: 800, maxSpeechMs: 30000, speechPadMs: 30,
+      };
+      this.state._persistentVadWs.send(JSON.stringify({
+        type: "reset_vad",
+        sampleRate: this.state._persistentMicSampleRate || 48000,
+        vad: vadConfig,
+      }));
+    }
+  }
+
   // ═══════════════  Persistent VAD events  ═══════════════
 
   _onPersistentVadEvent(event, socket) {
@@ -232,10 +252,9 @@ export class RealtimeAudioClient extends EventTarget {
         this.log(`persistent VAD ${data.type}`);
         break;
       case "vad_speech_start":
-        if (this.state.audioPlaying) {
-          // AI is speaking → barge-in
+        if (this.options.shouldAutoStartOnVad() && (this.state.audioPlaying || this.state.mode === "finalizing" || this.state.mode === "speaking")) {
           const cooldown = Number(this.options.bargeInCooldownMs || 800);
-          if (performance.now() - (this.state.startedAt || 0) < cooldown) {
+          if (this.state.audioPlaying && performance.now() - (this.state.startedAt || 0) < cooldown) {
             this.log("barge-in ignored during cooldown"); return;
           }
           this.emit("bargeIn", { probability: data.probability, timeMs: data.time_ms });
@@ -243,8 +262,7 @@ export class RealtimeAudioClient extends EventTarget {
             this.log(`barge-in failed: ${err.message || err}`, "error");
             this.setMode("idle");
           });
-        } else if (this.state.mode === "idle") {
-          // AI finished, user started speaking
+        } else if (this.options.shouldAutoStartOnVad() && this.state.mode === "idle") {
           this._doIdleStart().catch((err) => {
             this.log(`idle start failed: ${err.message || err}`, "error");
             this.setMode("idle");
@@ -344,6 +362,7 @@ export class RealtimeAudioClient extends EventTarget {
       model: this.options.getModel().trim(),
       prompt: this.options.getPrompt().trim(),
       routeContext: this.options.getRouteContext(),
+      conversationMode: this.options.getConversationMode(),
       session_id: this.options.getSessionId(),
       skillNames: this.options.getSkillNames(),
       outputAudio: Boolean(this.options.getOutputAudio()),
@@ -461,7 +480,7 @@ export class RealtimeAudioClient extends EventTarget {
 
   async playStandaloneAudio(audioDataUrl, historyText = "") {
     if (!audioDataUrl) return;
-    await this.startPassiveCapture();
+    if (this.options.shouldAutoStartOnVad()) await this.startPassiveCapture();
     this.state.finalReceived = true;
     this.state.interrupted = false;
     this.state.playedAssistantText = historyText || this.getDisplayedText();
@@ -480,6 +499,7 @@ export class RealtimeAudioClient extends EventTarget {
         return;
       }
       if (this.state.finalReceived && !this.state.interrupted) {
+        if (this.options.shouldAutoStartOnVad()) this.clearPassiveBufferAndResetVad();
         this.setMode("idle");
       }
       this.setVoiceState("播报完");
@@ -716,6 +736,7 @@ export class RealtimeAudioClient extends EventTarget {
     if (this.hasPendingPlayback()) {
       this.setMode("speaking");
     } else {
+      if (this.options.shouldAutoStartOnVad()) this.clearPassiveBufferAndResetVad();
       this.setMode("idle");
     }
     this.log(`final latency=${data.latency_ms}ms, audio_chunks=${data.audio_chunks || this.state.streamedAudioCount}, input=${data.saved_input_wav}`);

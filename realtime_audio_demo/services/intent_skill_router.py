@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from realtime_audio_demo.config import FINAL_MAX_TOKENS
-from realtime_audio_demo.services.qwen import apply_provider_options, post_json
+from realtime_audio_demo.services.qwen import apply_provider_options, json_object_response_format, post_json
 from realtime_audio_demo.services.skill_loader import list_runtime_skills, normalize_skill_name
 
 
@@ -126,6 +126,7 @@ async def repair_intent_json(model: str, raw_text: Any) -> tuple[dict[str, Any] 
         "max_tokens": min(FINAL_MAX_TOKENS, 256),
         "temperature": 0,
         "stream": False,
+        "response_format": json_object_response_format(),
     }
     payload = apply_provider_options(payload, modalities=["text"])
     response = await post_json_response(payload)
@@ -168,6 +169,7 @@ async def select_skill_for_intent(model: str, intent_json: dict[str, Any]) -> tu
         "max_tokens": min(FINAL_MAX_TOKENS, 256),
         "temperature": 0,
         "stream": False,
+        "response_format": json_object_response_format(),
     }
     payload = apply_provider_options(payload, modalities=["text"])
     response = await post_json_response(payload)

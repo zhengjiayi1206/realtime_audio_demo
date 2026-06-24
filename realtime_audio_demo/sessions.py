@@ -20,6 +20,7 @@ class AudioSession:
     prompt: str = DEFAULT_FINAL_PROMPT
     history: list[dict[str, str]] = field(default_factory=list)
     route_context: str = ""
+    conversation_mode: str = "manual"
     skill_names: list[str] = field(default_factory=list)
     output_audio: bool = False
     stream_speech_audio: bool = False

@@ -157,6 +157,10 @@ def apply_provider_options(
     return payload
 
 
+def json_object_response_format() -> dict[str, str]:
+    return {"type": "json_object"}
+
+
 def build_chat_payload(
     model: str,
     wav_bytes: bytes,
@@ -165,6 +169,7 @@ def build_chat_payload(
     history: Optional[list[dict[str, Any]]] = None,
     max_tokens: int,
     modalities: Optional[list[str]] = None,
+    response_format: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
     provider = resolved_provider()
@@ -207,6 +212,8 @@ def build_chat_payload(
         "temperature": 0,
         "stream": False,
     }
+    if response_format:
+        payload["response_format"] = response_format
     return apply_provider_options(payload, provider, modalities=modalities or ["text"])
 
 
@@ -218,6 +225,7 @@ def build_text_payload(
     history: Optional[list[dict[str, Any]]] = None,
     max_tokens: int,
     modalities: Optional[list[str]] = None,
+    response_format: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     messages = history_messages(history)
     content = user_text.strip()
@@ -238,6 +246,8 @@ def build_text_payload(
         "temperature": 0,
         "stream": False,
     }
+    if response_format:
+        payload["response_format"] = response_format
     return apply_provider_options(payload, modalities=modalities or ["text"])
 
 

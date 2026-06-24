@@ -17,6 +17,7 @@ async def request_text_completion(
     history: list[dict[str, str]],
     max_tokens: int,
     output_audio: bool = False,
+    response_format: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int]:
     payload = build_text_payload(
         model,
@@ -25,6 +26,7 @@ async def request_text_completion(
         history=history,
         max_tokens=max_tokens,
         modalities=["text", "audio"] if output_audio else ["text"],
+        response_format=response_format,
     )
 
     start = time.perf_counter()

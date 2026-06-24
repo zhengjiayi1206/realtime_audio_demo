@@ -649,7 +649,7 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script type="module">
-      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=voice-history-20260612";
+      import { RealtimeAudioClient } from "/static/realtime-audio-client.js?v=chatbox-mode-20260624-3";
 
       const els = {
         appShell: document.getElementById("appShell"),
@@ -680,10 +680,10 @@
       let textBusy = false;
       let textAudio = null;
       let autoConversation = false;
-      let restartTimer = null;
       let startInFlight = false;
       let toastTimer = null;
       let sessionId = crypto.randomUUID();
+      const fallbackDefaultSkills = ["intent-recognition"];
 
       /* ── resize handle ── */
       let resizing = false;
@@ -779,11 +779,13 @@
         getPrompt: () => "",
         getSessionId: () => sessionId,
         getRouteContext: () => "chatbox",
+        getConversationMode: () => (autoConversation ? "realtime" : "manual"),
         getPrefillMs: () => 600,
         getDisplayedText: () => assistantBubble?.textContent || "",
         getSkillNames: selectedSkills,
         getOutputAudio: outputAudioEnabled,
         getStreamSpeechAudio: outputAudioEnabled,
+        shouldAutoStartOnVad: () => autoConversation,
         shouldAutoStopOnVad: () => autoConversation,
         getVadConfig: () =>
           autoConversation
@@ -809,7 +811,7 @@
         updateLiveCallButton(mode);
         updateTextControls();
         if (mode === "idle" && autoConversation) {
-          scheduleRestart();
+          setStatus("倾听中", true);
         }
       });
 
@@ -887,7 +889,6 @@
           }
         } catch (err) {
           autoConversation = false;
-          clearRestartTimer();
           setStatus(err.message || String(err), false);
           client.setMode("idle");
         } finally {
@@ -908,6 +909,8 @@
             await client.startRecording();
           } else if (client.state.mode === "recording") {
             await client.stopRecording();
+          } else if (client.state.mode === "finalizing" || client.state.mode === "speaking") {
+            await client.interruptAndRecord();
           }
         } catch (err) {
           setStatus(err.message || String(err), false);
@@ -952,6 +955,10 @@
             checkbox.checked = true;
           }
         }
+      }
+
+      function applyDefaultSkills() {
+        applySelectedSkills(fallbackDefaultSkills, { replace: true });
       }
 
       function showToast(text) {
@@ -1092,6 +1099,10 @@
           label.appendChild(meta);
           els.skills.appendChild(label);
         }
+
+        if (!defaults.size) {
+          applyDefaultSkills();
+        }
       }
 
       function appendBubble(role, text) {
@@ -1130,7 +1141,6 @@
       function clearConversation() {
         autoConversation = false;
         startInFlight = false;
-        clearRestartTimer();
         stopTextAudio();
         client.stopPlayback();
         client.stopBargeInMonitor();
@@ -1139,6 +1149,7 @@
         sessionId = crypto.randomUUID();
         assistantBubble = null;
         els.conversation.innerHTML = '<div class="welcome">有什么可以帮你？</div>';
+        applyDefaultSkills();
         setStatus("idle", false);
         client.setMode("idle");
       }
@@ -1232,10 +1243,15 @@
         try {
           await client.unlockAudioOutput();
           if (!autoConversation) return;
-          await client.startRecording();
+          await client.startPassiveCapture();
+          if (typeof client.clearPassiveBufferAndResetVad === "function") {
+            client.clearPassiveBufferAndResetVad();
+          }
+          client.setMode("idle");
+          client.setVoiceState("倾听中");
+          setStatus("倾听中", true);
         } catch (err) {
           autoConversation = false;
-          clearRestartTimer();
           client.setMode("idle");
           client.setVoiceState("倾听中");
           throw err;
@@ -1249,7 +1265,6 @@
       function stopRealtimeConversation() {
         autoConversation = false;
         startInFlight = false;
-        clearRestartTimer();
         stopTextAudio();
         client.stopPlayback();
         client.stopBargeInMonitor();
@@ -1259,27 +1274,6 @@
         client.setVoiceState("倾听中");
         updateLiveCallButton("idle");
         updateTextControls();
-      }
-
-      function scheduleRestart() {
-        if (restartTimer || !autoConversation || client.state.mode !== "idle") return;
-        restartTimer = setTimeout(() => {
-          restartTimer = null;
-          if (!autoConversation || client.state.mode !== "idle") return;
-          client.startRecording().catch((err) => {
-            autoConversation = false;
-            client.setMode("idle");
-            client.setVoiceState("倾听中");
-            setStatus(err.message || String(err), false);
-            updateTextControls();
-          });
-        }, 550);
-      }
-
-      function clearRestartTimer() {
-        if (!restartTimer) return;
-        clearTimeout(restartTimer);
-        restartTimer = null;
       }
 
       function scrollToBottom() {
