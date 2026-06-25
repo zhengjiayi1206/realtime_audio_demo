@@ -53,12 +53,13 @@ if [[ -f "${PID_FILE}" ]]; then
   fi
 fi
 
-nohup "${VENV_PY}" -m uvicorn full_duplex_demo.app:app --host "${HOST}" --port "${PORT}" --log-level info > "${LOG_FILE}" 2>&1 &
+nohup "${VENV_PY}" -m uvicorn realtime_demo.app:app --host "${HOST}" --port "${PORT}" --log-level info > "${LOG_FILE}" 2>&1 &
 pid="$!"
 echo "${pid}" > "${PID_FILE}"
 
 echo "Started demo backend: pid=${pid}"
 echo "URL: http://127.0.0.1:${PORT}"
+echo "Realtime: http://127.0.0.1:${PORT}/realtime"
 echo "Full-duplex: http://127.0.0.1:${PORT}/full_duplex"
 echo "Log: ${LOG_FILE}"
 echo "Stop: kill \$(cat ${PID_FILE})"

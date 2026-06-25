@@ -39,4 +39,4 @@ export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-55785}"
 
 cd "${SCRIPT_DIR}"
-exec "${VENV_PY}" -m uvicorn full_duplex_demo.app:app --host "${HOST}" --port "${PORT}" --log-level info
+exec "${VENV_PY}" -m uvicorn realtime_demo.app:app --host "${HOST}" --port "${PORT}" --log-level info
